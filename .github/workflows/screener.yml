@@ -1,0 +1,78 @@
+name: Hedge Fund Stock Screener
+
+on:
+  schedule:
+    # Morning run — 01:00 UTC Mon–Fri (1hr after ASX opens, covers DST shifts)
+    - cron: "0 1 * * 1-5"
+    # Afternoon run — 05:00 UTC Mon–Fri (1hr before ASX closes, covers DST shifts)
+    - cron: "0 5 * * 1-5"
+  workflow_dispatch:
+    # Allow manual trigger from GitHub UI with optional run-type selection
+    inputs:
+      run_type:
+        description: "Run type (morning or afternoon)"
+        required: false
+        default: "morning"
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write credentials.json from secret
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
+
+      - name: Write .env file from secrets
+        run: |
+          cat <<EOF > .env
+          GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}
+          CREDENTIALS_FILE=credentials.json
+          SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
+          ENABLE_SLACK_ALERTS=${{ secrets.ENABLE_SLACK_ALERTS }}
+          EOF
+
+      - name: Determine run type
+        id: run_type
+        run: |
+          # Manual trigger: use the input value
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "type=${{ github.event.inputs.run_type }}" >> $GITHUB_OUTPUT
+          # Scheduled: pick morning or afternoon based on UTC hour
+          elif [ "$(date -u +%H)" = "01" ]; then
+            echo "type=morning" >> $GITHUB_OUTPUT
+          else
+            echo "type=afternoon" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run stock screener
+        run: python main.py --run-type ${{ steps.run_type.outputs.type }}
+
+      - name: Upload CSV backup as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-csv-${{ steps.run_type.outputs.type }}-${{ github.run_id }}
+          path: "*.csv"
+          retention-days: 30
+
+      - name: Upload run history as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-history-${{ github.run_id }}
+          path: run_history.json
+          retention-days: 30

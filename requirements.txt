@@ -1,0 +1,30 @@
+# Core data fetching
+yfinance>=0.2.36
+yahooquery>=2.3.7
+
+# Google Sheets integration
+gspread>=6.0.0
+google-auth>=2.27.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+
+# Data processing
+pandas>=2.1.0
+numpy>=1.26.0
+
+# Progress & utilities
+tqdm>=4.66.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# HTML table parsing (for Wikipedia ticker lists)
+lxml>=5.0.0
+html5lib>=1.1
+
+# Optional: broader stock universe (uncomment to use)
+# financedatabase>=2.2.0
+
+# Scheduling
+APScheduler>=3.10.0
+exchange-calendars>=4.5
+pytz

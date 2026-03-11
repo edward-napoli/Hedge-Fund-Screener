@@ -1,0 +1,25 @@
+# Claude Code settings
+.claude/
+
+# Secrets — never commit these
+.env
+credentials.json
+credentials.json.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Generated outputs
+*.csv
+*.log
+run_history.json
+cache/
+logs/
+
+# IDE
+.vscode/
+.idea/
