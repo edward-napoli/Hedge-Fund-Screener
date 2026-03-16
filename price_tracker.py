@@ -18,6 +18,9 @@ from typing import Optional
 
 import pandas as pd
 import yfinance as yf
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from config import EXCHANGE_MAP
 
