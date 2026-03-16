@@ -33,6 +33,9 @@ import sys
 import time
 from datetime import datetime, timezone
 
+# Score history file written after each run
+_SCORE_HISTORY_FILE = "cache/score_history.json"
+
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -80,6 +83,69 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 RUN_HISTORY_FILE  = "run_history.json"
 _RETRY_WAIT_SECS  = 15 * 60   # 15 minutes between automatic retries
+
+
+# ---------------------------------------------------------------------------
+# Score history
+# ---------------------------------------------------------------------------
+
+def save_score_history(df: pd.DataFrame, date_str: str, run_type: str) -> None:
+    """
+    Append today's Clayton Scores to cache/score_history.json.
+
+    Priority rule: afternoon entries overwrite morning entries for the same
+    date; morning entries do NOT overwrite an existing afternoon entry.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Fully scored and ranked DataFrame (must contain 'Ticker',
+        'Composite Score', and 'Rank' columns).
+    date_str : str
+        Date key in "YYYY-MM-DD" format.
+    run_type : str
+        "morning" or "afternoon".
+    """
+    path = _SCORE_HISTORY_FILE
+    history: dict = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except Exception:
+            history = {}
+
+    # Afternoon takes priority; don't overwrite afternoon with morning
+    existing = history.get(date_str, {})
+    if existing.get("run_type") == "afternoon" and run_type == "morning":
+        logger.info(
+            f"Score history for {date_str} already has an afternoon entry — "
+            "skipping morning overwrite."
+        )
+        return
+
+    stocks_data: dict = {}
+    for _, row in df.iterrows():
+        try:
+            stocks_data[str(row["Ticker"])] = {
+                "score": float(row["Composite Score"]),
+                "rank":  int(row["Rank"]),
+            }
+        except (TypeError, ValueError):
+            pass
+
+    history[date_str] = {
+        "run_type":  run_type,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "stocks":    stocks_data,
+    }
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+        logger.info(f"Score history saved: {len(stocks_data)} stocks for {date_str}.")
+    except Exception as exc:
+        logger.error(f"Could not save score history: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +282,15 @@ def _do_run(run_type: str) -> dict:
     # 6. Compute deltas vs previous run
     # ------------------------------------------------------------------
     df = compute_deltas(df, previous)
+
+    # ------------------------------------------------------------------
+    # 6b. Persist Clayton Scores to score_history.json
+    # ------------------------------------------------------------------
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        save_score_history(df, today_str, run_type)
+    except Exception as exc:
+        logger.error(f"save_score_history failed: {exc}")
 
     # ------------------------------------------------------------------
     # 7. Health check — flag partial runs

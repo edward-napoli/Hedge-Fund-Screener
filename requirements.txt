@@ -11,6 +11,7 @@ google-auth-httplib2>=0.2.0
 # Data processing
 pandas>=2.1.0
 numpy>=1.26.0
+scipy>=1.12.0
 
 # Progress & utilities
 tqdm>=4.66.0

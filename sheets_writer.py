@@ -63,6 +63,9 @@ _RETENTION_DAYS = 30
 # Pattern for recognising dated tab names ("YYYY-MM-DD")
 _DATE_TAB_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# Permanent tabs that are NEVER deleted by _delete_old_tabs
+_PERMANENT_TABS = {"Summary", "Analytics", "Price History", "Score History", "Efficacy Analysis"}
+
 RUN_HISTORY_FILE = "run_history.json"
 
 
@@ -808,6 +811,8 @@ def _delete_old_tabs(ss: gspread.Spreadsheet) -> None:
     to_delete: list = []
 
     for ws in ss.worksheets():
+        if ws.title in _PERMANENT_TABS:
+            continue  # never delete permanent tabs
         if _DATE_TAB_RE.match(ws.title):
             try:
                 tab_date = datetime.strptime(ws.title, "%Y-%m-%d")
@@ -1018,6 +1023,593 @@ def write_analytics_tab(
         logger.warning(f"Analytics tab formatting partially failed: {exc}")
 
     logger.info("Analytics tab written.")
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Price History tab
+# ---------------------------------------------------------------------------
+
+def update_price_history_tab(
+    ss: gspread.Spreadsheet,
+    price_history: dict,
+    score_history: dict,
+) -> gspread.Worksheet:
+    """
+    Create / update the permanent 'Price History' worksheet.
+
+    Layout
+    ------
+    - Row 1 : Header — ["Ticker", <date1>, <date2>, ...] (dates ascending)
+    - For each ticker row: price_usd per date (or blank if unavailable)
+    - Row after each price row: percentage change from previous date's price
+      (positive → green text, negative → red text)
+    - First column (Ticker) is frozen.
+
+    Parameters
+    ----------
+    ss : gspread.Spreadsheet
+    price_history : dict
+        Mapping date_str → {ticker → price_data_dict}.
+    score_history : dict
+        Mapping date_str → {stocks: {ticker → {score, rank}}}.
+
+    Returns
+    -------
+    gspread.Worksheet
+    """
+    ws = _get_or_create_worksheet(ss, "Price History", rows=5000, cols=200)
+    ws.clear()
+
+    sorted_dates = sorted(price_history.keys())
+    if not sorted_dates:
+        ws.update("A1", [["Price History — no data yet."]])
+        return ws
+
+    # Collect all tickers (union across all dates)
+    all_tickers: set = set()
+    for date_str in sorted_dates:
+        all_tickers.update(price_history[date_str].keys())
+    all_tickers_sorted = sorted(all_tickers)
+
+    # Header row
+    header = ["Ticker"] + sorted_dates
+    all_rows = [header]
+
+    # Per-ticker rows + pct-change rows
+    for ticker in all_tickers_sorted:
+        price_row = [ticker]
+        pct_row   = [""]   # blank ticker cell for the pct-change row
+
+        prev_price = None
+        for date_str in sorted_dates:
+            day_data   = price_history[date_str].get(ticker, {})
+            price_usd  = day_data.get("price_usd") if isinstance(day_data, dict) else None
+
+            price_row.append(round(price_usd, 4) if price_usd is not None else "")
+
+            if price_usd is not None and prev_price is not None and prev_price != 0:
+                pct = round((price_usd - prev_price) / prev_price * 100, 2)
+                pct_row.append(pct)
+            else:
+                pct_row.append("")
+
+            prev_price = price_usd if price_usd is not None else prev_price
+
+        all_rows.append(price_row)
+        all_rows.append(pct_row)
+
+    ws.update("A1", all_rows, value_input_option="USER_ENTERED")
+
+    # ---- Formatting ----
+    sheet_id  = ws.id
+    num_cols  = len(header)
+    num_tickers = len(all_tickers_sorted)
+
+    batch_reqs: list = []
+
+    # Freeze header row + first column
+    batch_reqs.append({
+        "updateSheetProperties": {
+            "properties": {
+                "sheetId": sheet_id,
+                "gridProperties": {
+                    "frozenRowCount": 1,
+                    "frozenColumnCount": 1,
+                },
+            },
+            "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+        }
+    })
+
+    # Header formatting
+    batch_reqs.append(_header_format_request(sheet_id, num_cols, start_row=0))
+
+    # Auto-resize
+    batch_reqs.append(_auto_resize_request(sheet_id, num_cols))
+
+    # Colour the pct-change rows: positive → green text, negative → red text
+    # pct rows are at 0-based row indices: 2, 4, 6, ... (row 1 = header, row 2 = first price, row 3 = first pct, ...)
+    pct_row_requests: list = []
+    for i in range(num_tickers):
+        pct_row_idx = 1 + i * 2 + 1  # 0-based: header=0, then price+pct pairs
+        # We use a conditional formatting rule per cell column range for pct rows
+        # Apply green text for positive values
+        pct_row_requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId":          sheet_id,
+                        "startRowIndex":    pct_row_idx,
+                        "endRowIndex":      pct_row_idx + 1,
+                        "startColumnIndex": 1,
+                        "endColumnIndex":   num_cols,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type":   "NUMBER_GREATER",
+                            "values": [{"userEnteredValue": "0"}],
+                        },
+                        "format": {
+                            "textFormat": {"foregroundColor": _rgb(GREEN_COLOR)},
+                        },
+                    },
+                },
+                "index": 0,
+            }
+        })
+        # Apply red text for negative values
+        pct_row_requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId":          sheet_id,
+                        "startRowIndex":    pct_row_idx,
+                        "endRowIndex":      pct_row_idx + 1,
+                        "startColumnIndex": 1,
+                        "endColumnIndex":   num_cols,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type":   "NUMBER_LESS",
+                            "values": [{"userEnteredValue": "0"}],
+                        },
+                        "format": {
+                            "textFormat": {"foregroundColor": _rgb(RED_COLOR)},
+                        },
+                    },
+                },
+                "index": 0,
+            }
+        })
+
+    try:
+        ss.batch_update({"requests": batch_reqs})
+    except Exception as exc:
+        logger.warning(f"Price History tab base formatting failed: {exc}")
+
+    if pct_row_requests:
+        # Send CF rules in batches of 100 to avoid API limits
+        chunk_size = 100
+        for start in range(0, len(pct_row_requests), chunk_size):
+            chunk = pct_row_requests[start: start + chunk_size]
+            try:
+                ss.batch_update({"requests": chunk})
+            except Exception as exc:
+                logger.warning(f"Price History pct-row CF batch failed: {exc}")
+
+    logger.info(
+        f"Price History tab updated: {len(all_tickers_sorted)} tickers, "
+        f"{len(sorted_dates)} dates."
+    )
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Score History tab
+# ---------------------------------------------------------------------------
+
+def update_score_history_tab(
+    ss: gspread.Spreadsheet,
+    score_history: dict,
+    price_history: dict,
+) -> gspread.Worksheet:
+    """
+    Create / update the permanent 'Score History' worksheet.
+
+    Layout
+    ------
+    - Row 1: Header — ["Ticker", <date1_score>, <date1_rank>, <date2_score>, ...]
+      (paired Score | Rank columns per date, dates ascending)
+    - For each ticker row: Clayton Score and Rank per date
+    - Row after each stock row: absolute score change and rank change from previous date
+      (score/rank improvements → green text, deteriorations → red text)
+    - First column (Ticker) is frozen.
+
+    Parameters
+    ----------
+    ss : gspread.Spreadsheet
+    score_history : dict
+        Mapping date_str → {run_type, timestamp, stocks: {ticker → {score, rank}}}.
+    price_history : dict
+        Not used for data, but accepted for API consistency.
+
+    Returns
+    -------
+    gspread.Worksheet
+    """
+    ws = _get_or_create_worksheet(ss, "Score History", rows=5000, cols=200)
+    ws.clear()
+
+    sorted_dates = sorted(score_history.keys())
+    if not sorted_dates:
+        ws.update("A1", [["Score History — no data yet."]])
+        return ws
+
+    # Collect all tickers
+    all_tickers: set = set()
+    for date_str in sorted_dates:
+        all_tickers.update(score_history[date_str].get("stocks", {}).keys())
+    all_tickers_sorted = sorted(all_tickers)
+
+    # Header: Ticker, then pairs of Score/Rank columns per date
+    header = ["Ticker"]
+    for date_str in sorted_dates:
+        header.append(f"{date_str} Score")
+        header.append(f"{date_str} Rank")
+
+    all_rows = [header]
+
+    for ticker in all_tickers_sorted:
+        score_row = [ticker]
+        delta_row = [""]
+
+        prev_score = None
+        prev_rank  = None
+        for date_str in sorted_dates:
+            stocks = score_history[date_str].get("stocks", {})
+            data   = stocks.get(ticker)
+            if data:
+                score = data.get("score")
+                rank  = data.get("rank")
+                score_row.append(round(score, 2) if score is not None else "")
+                score_row.append(rank if rank is not None else "")
+
+                # Delta vs previous date
+                if prev_score is not None and score is not None:
+                    delta_row.append(round(score - prev_score, 2))
+                else:
+                    delta_row.append("")
+                if prev_rank is not None and rank is not None:
+                    delta_row.append(rank - prev_rank)
+                else:
+                    delta_row.append("")
+
+                prev_score = score
+                prev_rank  = rank
+            else:
+                score_row.extend(["", ""])
+                delta_row.extend(["", ""])
+
+        all_rows.append(score_row)
+        all_rows.append(delta_row)
+
+    ws.update("A1", all_rows, value_input_option="USER_ENTERED")
+
+    # ---- Formatting ----
+    sheet_id  = ws.id
+    num_cols  = len(header)
+    num_tickers = len(all_tickers_sorted)
+
+    batch_reqs: list = []
+
+    # Freeze header row + first column
+    batch_reqs.append({
+        "updateSheetProperties": {
+            "properties": {
+                "sheetId": sheet_id,
+                "gridProperties": {
+                    "frozenRowCount": 1,
+                    "frozenColumnCount": 1,
+                },
+            },
+            "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+        }
+    })
+
+    # Header formatting
+    batch_reqs.append(_header_format_request(sheet_id, num_cols, start_row=0))
+
+    # Auto-resize
+    batch_reqs.append(_auto_resize_request(sheet_id, num_cols))
+
+    try:
+        ss.batch_update({"requests": batch_reqs})
+    except Exception as exc:
+        logger.warning(f"Score History tab base formatting failed: {exc}")
+
+    # Conditional formatting for delta rows (green = improvement, red = deterioration)
+    cf_reqs: list = []
+    for i in range(num_tickers):
+        delta_row_idx = 1 + i * 2 + 1  # 0-based
+        # Score delta: positive is good (score went up)
+        cf_reqs.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId":          sheet_id,
+                        "startRowIndex":    delta_row_idx,
+                        "endRowIndex":      delta_row_idx + 1,
+                        "startColumnIndex": 1,
+                        "endColumnIndex":   num_cols,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type":   "NUMBER_GREATER",
+                            "values": [{"userEnteredValue": "0"}],
+                        },
+                        "format": {"textFormat": {"foregroundColor": _rgb(GREEN_COLOR)}},
+                    },
+                },
+                "index": 0,
+            }
+        })
+        cf_reqs.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId":          sheet_id,
+                        "startRowIndex":    delta_row_idx,
+                        "endRowIndex":      delta_row_idx + 1,
+                        "startColumnIndex": 1,
+                        "endColumnIndex":   num_cols,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type":   "NUMBER_LESS",
+                            "values": [{"userEnteredValue": "0"}],
+                        },
+                        "format": {"textFormat": {"foregroundColor": _rgb(RED_COLOR)}},
+                    },
+                },
+                "index": 0,
+            }
+        })
+
+    chunk_size = 100
+    for start in range(0, len(cf_reqs), chunk_size):
+        chunk = cf_reqs[start: start + chunk_size]
+        try:
+            ss.batch_update({"requests": chunk})
+        except Exception as exc:
+            logger.warning(f"Score History CF batch failed: {exc}")
+
+    logger.info(
+        f"Score History tab updated: {len(all_tickers_sorted)} tickers, "
+        f"{len(sorted_dates)} dates."
+    )
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Efficacy Analysis tab
+# ---------------------------------------------------------------------------
+
+def write_efficacy_tab(
+    ss: gspread.Spreadsheet,
+    metrics: dict,
+    trading_days: int,
+) -> gspread.Worksheet:
+    """
+    Create / update the permanent 'Efficacy Analysis' worksheet.
+
+    Writes a human-readable report of Clayton Score predictive power across
+    five sections:
+    1. Portfolio-level correlation (Score → Forward Returns)
+    2. Quintile performance analysis
+    3. Rolling 30-day correlation (Score vs 5D return)
+    4. Top-25 entry validation
+    5. Per-stock correlation (top 30 by |r| for 5D return)
+
+    Parameters
+    ----------
+    ss : gspread.Spreadsheet
+    metrics : dict
+        Output of efficacy_analyzer compute_* functions, merged into one dict.
+    trading_days : int
+        Number of trading days analysed.
+
+    Returns
+    -------
+    gspread.Worksheet
+    """
+    ws = _get_or_create_worksheet(ss, "Efficacy Analysis", rows=500, cols=20)
+    ws.clear()
+
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    def _fmt_r(v) -> str:
+        return f"{v:.4f}" if v is not None else "N/A"
+
+    def _fmt_p(v) -> str:
+        if v is None:
+            return "N/A"
+        return f"{v:.6f}"
+
+    def _sig(p) -> str:
+        if p is None:
+            return "—"
+        return "YES (p<0.05)" if p < 0.05 else "NO"
+
+    def _fmt_pct(v) -> str:
+        return f"{v:.4f}%" if v is not None else "N/A"
+
+    rows: list = []
+
+    # Title
+    rows.append(["EFFICACY ANALYSIS — CLAYTON SCORE PREDICTIVE POWER"])
+    rows.append([f"Data as of: {now_str}  |  Trading days analysed: {trading_days}"])
+    rows.append([])
+
+    # Section 1: Portfolio-level correlation
+    rows.append(["SECTION 1: PORTFOLIO-LEVEL CORRELATION (Clayton Score → Forward Returns)"])
+    rows.append(["Forward Period", "Pearson r", "p-value", "Significant?"])
+    for period, r_key, p_key in [
+        ("1-Day",  "portfolio_1d",  "p_value_1d"),
+        ("5-Day",  "portfolio_5d",  "p_value_5d"),
+        ("21-Day", "portfolio_21d", "p_value_21d"),
+    ]:
+        r = metrics.get(r_key)
+        p = metrics.get(p_key)
+        rows.append([period, _fmt_r(r), _fmt_p(p), _sig(p)])
+    rows.append([])
+
+    # Section 2: Quintile performance
+    rows.append(["SECTION 2: QUINTILE PERFORMANCE ANALYSIS"])
+    rows.append(["Quintile", "Avg 1D Return", "Avg 5D Return", "Avg 21D Return"])
+    quintile_labels = [
+        "Q1 (Lowest 20%)",
+        "Q2",
+        "Q3",
+        "Q4",
+        "Q5 (Highest 20%)",
+    ]
+    q1d  = metrics.get("quintile_avg_1d",  [None] * 5)
+    q5d  = metrics.get("quintile_avg_5d",  [None] * 5)
+    q21d = metrics.get("quintile_avg_21d", [None] * 5)
+    for i, label in enumerate(quintile_labels):
+        v1  = q1d[i]  if i < len(q1d)  else None
+        v5  = q5d[i]  if i < len(q5d)  else None
+        v21 = q21d[i] if i < len(q21d) else None
+        rows.append([label, _fmt_pct(v1), _fmt_pct(v5), _fmt_pct(v21)])
+
+    # Q5 - Q1 spread
+    rows.append([
+        "Q5 − Q1 Spread",
+        _fmt_pct(metrics.get("q5_minus_q1_1d")),
+        _fmt_pct(metrics.get("q5_minus_q1_5d")),
+        _fmt_pct(metrics.get("q5_minus_q1_21d")),
+    ])
+    rows.append([])
+
+    # Section 3: Rolling correlation
+    rows.append(["SECTION 3: ROLLING 30-DAY CORRELATION (Score vs 5D Return)"])
+    rows.append(["Date", "Correlation"])
+    rolling = metrics.get("rolling_correlation", [])
+    if rolling:
+        for entry in rolling:
+            rows.append([entry.get("date", ""), _fmt_r(entry.get("correlation"))])
+    else:
+        rows.append(["(No rolling data yet)", ""])
+    rows.append([])
+
+    # Section 4: Top-25 validation
+    rows.append(["SECTION 4: TOP-25 ENTRY VALIDATION"])
+    rows.append(["Metric", "1-Day", "5-Day", "21-Day"])
+    rows.append([
+        "Avg Top-25 Entry Return",
+        _fmt_pct(metrics.get("top25_avg_top25_1d")),
+        _fmt_pct(metrics.get("top25_avg_top25_5d")),
+        _fmt_pct(metrics.get("top25_avg_top25_21d")),
+    ])
+    rows.append([
+        "Avg All-Stock Return",
+        _fmt_pct(metrics.get("top25_avg_all_1d")),
+        _fmt_pct(metrics.get("top25_avg_all_5d")),
+        _fmt_pct(metrics.get("top25_avg_all_21d")),
+    ])
+    # Outperformance
+    def _diff(a, b):
+        if a is not None and b is not None:
+            return round(a - b, 4)
+        return None
+
+    rows.append([
+        "Outperformance",
+        _fmt_pct(_diff(metrics.get("top25_avg_top25_1d"), metrics.get("top25_avg_all_1d"))),
+        _fmt_pct(_diff(metrics.get("top25_avg_top25_5d"), metrics.get("top25_avg_all_5d"))),
+        _fmt_pct(_diff(metrics.get("top25_avg_top25_21d"), metrics.get("top25_avg_all_21d"))),
+    ])
+    event_count = metrics.get("top25_event_count", 0)
+    rows.append([f"Events analysed: {event_count}", "", "", ""])
+    rows.append([])
+
+    # Section 5: Per-stock correlation (top 30 by |5D r|)
+    rows.append(["SECTION 5: PER-STOCK CORRELATION (Top 30 by |r| for 5D return)"])
+    rows.append(["Ticker", "1D r", "5D r", "21D r"])
+    per_5d = metrics.get("per_stock_5d", {})
+    per_1d = metrics.get("per_stock_1d", {})
+    per_21d = metrics.get("per_stock_21d", {})
+    sorted_tickers = sorted(per_5d.keys(), key=lambda t: abs(per_5d[t]), reverse=True)[:30]
+    if sorted_tickers:
+        for ticker in sorted_tickers:
+            rows.append([
+                ticker,
+                _fmt_r(per_1d.get(ticker)),
+                _fmt_r(per_5d.get(ticker)),
+                _fmt_r(per_21d.get(ticker)),
+            ])
+    else:
+        rows.append(["(No per-stock data yet)", "", "", ""])
+
+    ws.update("A1", rows, value_input_option="USER_ENTERED")
+
+    # Bold section title rows
+    sheet_id = ws.id
+    bold_indices = [i for i, r in enumerate(rows) if r and isinstance(r[0], str) and
+                    (r[0].startswith("SECTION") or r[0].startswith("EFFICACY"))]
+    bold_reqs = [
+        _bold_text_request(sheet_id, ri, ri + 1, 0, 10, bold=True, font_size=11)
+        for ri in bold_indices
+    ]
+    bold_reqs.append({
+        "autoResizeDimensions": {
+            "dimensions": {
+                "sheetId":    sheet_id,
+                "dimension":  "COLUMNS",
+                "startIndex": 0,
+                "endIndex":   10,
+            }
+        }
+    })
+    try:
+        ss.batch_update({"requests": bold_reqs})
+    except Exception as exc:
+        logger.warning(f"Efficacy tab formatting failed: {exc}")
+
+    logger.info("Efficacy Analysis tab written.")
+    return ws
+
+
+def write_efficacy_tab_insufficient(
+    ss: gspread.Spreadsheet,
+    days_collected: int = 0,
+) -> gspread.Worksheet:
+    """
+    Write a placeholder message to the 'Efficacy Analysis' tab when there is
+    insufficient data (fewer than 21 trading days).
+
+    Parameters
+    ----------
+    ss : gspread.Spreadsheet
+    days_collected : int
+        Number of trading days of data currently available.
+
+    Returns
+    -------
+    gspread.Worksheet
+    """
+    ws = _get_or_create_worksheet(ss, "Efficacy Analysis", rows=10, cols=5)
+    ws.clear()
+    ws.update(
+        "A1",
+        [[
+            f"Insufficient data — efficacy analysis will populate after "
+            f"{21} trading days. "
+            f"Currently: {days_collected} day(s) of data collected."
+        ]],
+    )
+    logger.info("Efficacy Analysis placeholder written (insufficient data).")
     return ws
 
 

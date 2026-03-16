@@ -95,7 +95,8 @@ CREDENTIALS_FILE      = os.getenv("CREDENTIALS_FILE", "credentials.json")
 LOG_FILE              = "logs/errors.log"
 SLACK_WEBHOOK_URL     = os.getenv("SLACK_WEBHOOK_URL", "")
 ENABLE_SLACK_ALERTS   = os.getenv("ENABLE_SLACK_ALERTS", "false").lower() == "true"
-PARTIAL_RUN_THRESHOLD = 400   # flag run as "partial" if fewer stocks fetched
+PARTIAL_RUN_THRESHOLD       = 400   # flag run as "partial" if fewer stocks fetched
+PRICE_FETCH_DELAY_MINUTES   = int(os.getenv("PRICE_FETCH_DELAY_MINUTES", "15"))
 
 # ---------------------------------------------------------------------------
 # Google Sheets colours  (normalised 0–1 RGB)

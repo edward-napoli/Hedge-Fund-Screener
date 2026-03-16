@@ -83,10 +83,11 @@ def _local_to_utc(hour: int, minute: int, tz_str: str, ref_date: date) -> dateti
 
 def _get_schedule_times(ref_date: date) -> tuple:
     """
-    Compute the morning and afternoon run times (UTC) for ref_date.
+    Compute the morning, afternoon, and price-fetch run times (UTC) for ref_date.
 
-    morning   = earliest UTC market open  + 1 hour
-    afternoon = earliest UTC market close - 1 hour
+    morning      = earliest UTC market open  + 1 hour
+    afternoon    = earliest UTC market close - 1 hour
+    price_fetch  = latest UTC market close   + PRICE_FETCH_DELAY_MINUTES
 
     Parameters
     ----------
@@ -95,22 +96,26 @@ def _get_schedule_times(ref_date: date) -> tuple:
 
     Returns
     -------
-    tuple[datetime, datetime]
-        (morning_utc, afternoon_utc) — timezone-aware UTC datetimes.
+    tuple[datetime, datetime, datetime]
+        (morning_utc, afternoon_utc, price_fetch_utc) — timezone-aware UTC datetimes.
     """
+    from config import PRICE_FETCH_DELAY_MINUTES
+
     opens  = []
     closes = []
     for name, (oh, om), (ch, cm), tz_str, _ in EXCHANGES:
         opens.append(_local_to_utc(oh, om, tz_str, ref_date))
         closes.append(_local_to_utc(ch, cm, tz_str, ref_date))
 
-    earliest_open  = min(opens)
-    earliest_close = min(closes)
+    earliest_open   = min(opens)
+    earliest_close  = min(closes)
+    latest_close    = max(closes)
 
-    morning   = earliest_open  + timedelta(hours=1)
-    afternoon = earliest_close - timedelta(hours=1)
+    morning      = earliest_open  + timedelta(hours=1)
+    afternoon    = earliest_close - timedelta(hours=1)
+    price_fetch  = latest_close   + timedelta(minutes=PRICE_FETCH_DELAY_MINUTES)
 
-    return morning, afternoon
+    return morning, afternoon, price_fetch
 
 
 # ---------------------------------------------------------------------------
@@ -226,22 +231,41 @@ def run_afternoon() -> None:
         logger.error(f"Afternoon run failed: {exc}", exc_info=True)
 
 
+def run_price_fetch_job() -> None:
+    """
+    Execute the daily price fetch after all markets have closed.
+
+    Checks _should_run() before delegating to price_tracker.run_price_fetch().
+    """
+    today = date.today()
+    if not _should_run(today):
+        return
+    logger.info(f"Firing PRICE FETCH for {today}.")
+    try:
+        from price_tracker import run_price_fetch
+        run_price_fetch()
+    except Exception as exc:
+        logger.error(f"Price fetch failed: {exc}", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Stateful tracker — prevents double-firing within the same day
 # ---------------------------------------------------------------------------
-_morning_fired_today:   str = ""
-_afternoon_fired_today: str = ""
+_morning_fired_today:     str = ""
+_afternoon_fired_today:   str = ""
+_price_fetched_today:     str = ""
 
 
 def _check_and_fire() -> None:
     """
     Called every minute by the interval job.
 
-    Fires morning and/or afternoon runs when the current UTC time falls within
-    a 2-minute window starting at the dynamically computed run time.  Guards
-    against double-firing by storing the date string of the last fire.
+    Fires morning, afternoon, and price-fetch runs when the current UTC time
+    falls within a 2-minute window starting at the dynamically computed run
+    time.  Guards against double-firing by storing the date string of the
+    last fire for each job.
     """
-    global _morning_fired_today, _afternoon_fired_today
+    global _morning_fired_today, _afternoon_fired_today, _price_fetched_today
 
     now_utc   = datetime.now(timezone.utc)
     today     = now_utc.date()
@@ -250,7 +274,7 @@ def _check_and_fire() -> None:
     if not _should_run(today):
         return
 
-    morning_utc, afternoon_utc = _get_schedule_times(today)
+    morning_utc, afternoon_utc, price_fetch_utc = _get_schedule_times(today)
 
     # Fire morning run if within [morning_utc, morning_utc + 2 min) and not yet fired
     if (
@@ -270,6 +294,15 @@ def _check_and_fire() -> None:
         _afternoon_fired_today = today_str
         run_afternoon()
 
+    # Fire price fetch if within [price_fetch_utc, price_fetch_utc + 2 min) and not yet fired
+    if (
+        _price_fetched_today != today_str
+        and price_fetch_utc <= now_utc < price_fetch_utc + timedelta(minutes=2)
+    ):
+        logger.info(f"Price fetch window reached at {now_utc.strftime('%H:%M UTC')}.")
+        _price_fetched_today = today_str
+        run_price_fetch_job()
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -279,17 +312,19 @@ def main() -> None:
     """
     Start the blocking scheduler.
 
-    Logs today's computed run times, then starts an interval job that checks
-    every minute whether it is time to fire a screener run.
+    Logs today's computed run times (morning, afternoon, price fetch), then
+    starts an interval job that checks every minute whether it is time to
+    fire a screener or price-fetch run.
     """
-    today               = date.today()
-    morning_utc, afternoon_utc = _get_schedule_times(today)
+    today = date.today()
+    morning_utc, afternoon_utc, price_fetch_utc = _get_schedule_times(today)
 
     logger.info("=" * 60)
     logger.info("Hedge Fund Stock Screener — Scheduler Starting")
     logger.info(f"Today ({today}) schedule:")
-    logger.info(f"  Morning run:   {morning_utc.strftime('%H:%M UTC')}")
-    logger.info(f"  Afternoon run: {afternoon_utc.strftime('%H:%M UTC')}")
+    logger.info(f"  Morning run:    {morning_utc.strftime('%H:%M UTC')}")
+    logger.info(f"  Afternoon run:  {afternoon_utc.strftime('%H:%M UTC')}")
+    logger.info(f"  Price fetch:    {price_fetch_utc.strftime('%H:%M UTC')}")
     logger.info("(Times are dynamic — recalculated daily based on market open/close + DST)")
     logger.info("=" * 60)
 

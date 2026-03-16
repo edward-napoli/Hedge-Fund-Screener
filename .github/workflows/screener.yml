@@ -6,11 +6,13 @@ on:
     - cron: "0 1 * * 1-5"
     # Afternoon run — 05:00 UTC Mon–Fri (1hr before ASX closes, covers DST shifts)
     - cron: "0 5 * * 1-5"
+    # Price fetch — 21:30 UTC Mon–Fri (30min after NYSE closes at 21:00 UTC summer)
+    - cron: "30 21 * * 1-5"
   workflow_dispatch:
     # Allow manual trigger from GitHub UI with optional run-type selection
     inputs:
       run_type:
-        description: "Run type (morning or afternoon)"
+        description: "Run type (morning, afternoon, or price_fetch)"
         required: false
         default: "morning"
 
@@ -43,6 +45,7 @@ jobs:
           CREDENTIALS_FILE=credentials.json
           SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
           ENABLE_SLACK_ALERTS=${{ secrets.ENABLE_SLACK_ALERTS }}
+          PRICE_FETCH_DELAY_MINUTES=15
           EOF
 
       - name: Determine run type
@@ -51,15 +54,22 @@ jobs:
           # Manual trigger: use the input value
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "type=${{ github.event.inputs.run_type }}" >> $GITHUB_OUTPUT
-          # Scheduled: pick morning or afternoon based on UTC hour
+          # Scheduled: pick run type based on UTC hour
           elif [ "$(date -u +%H)" = "01" ]; then
             echo "type=morning" >> $GITHUB_OUTPUT
+          elif [ "$(date -u +%H)" -ge "21" ]; then
+            echo "type=price_fetch" >> $GITHUB_OUTPUT
           else
             echo "type=afternoon" >> $GITHUB_OUTPUT
           fi
 
-      - name: Run stock screener
-        run: python main.py --run-type ${{ steps.run_type.outputs.type }}
+      - name: Run stock screener or price fetch
+        run: |
+          if [ "${{ steps.run_type.outputs.type }}" = "price_fetch" ]; then
+            python price_tracker.py
+          else
+            python main.py --run-type ${{ steps.run_type.outputs.type }}
+          fi
 
       - name: Upload CSV backup as artifact
         if: always()
