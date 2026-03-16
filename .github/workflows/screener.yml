@@ -48,6 +48,17 @@ jobs:
           PRICE_FETCH_DELAY_MINUTES=15
           EOF
 
+      # Restore cache/ and run_history.json from previous runs
+      - name: Restore persistent cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache/
+            run_history.json
+          key: screener-persist-${{ runner.os }}
+          restore-keys: |
+            screener-persist-${{ runner.os }}
+
       - name: Determine run type
         id: run_type
         run: |
@@ -70,6 +81,16 @@ jobs:
           else
             python main.py --run-type ${{ steps.run_type.outputs.type }}
           fi
+
+      # Save cache/ and run_history.json so the next run can use them
+      - name: Save persistent cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            cache/
+            run_history.json
+          key: screener-persist-${{ runner.os }}
 
       - name: Upload CSV backup as artifact
         if: always()

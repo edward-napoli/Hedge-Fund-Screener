@@ -345,27 +345,30 @@ def run_price_fetch() -> None:
     _fx_rate_cache = {}
 
     # ------------------------------------------------------------------
-    # 2. Load screened universe
+    # 2. Load screened universe — from cache if available, else fetch fresh
     # ------------------------------------------------------------------
     cache_file = "cache/last_run.json"
-    if not os.path.exists(cache_file):
-        logger.warning(f"No last_run.json found at {cache_file}. Price fetch aborted.")
-        return
+    tickers: list[str] = []
 
-    try:
-        with open(cache_file, "r", encoding="utf-8") as f:
-            last_run = json.load(f)
-    except Exception as exc:
-        logger.error(f"Could not read {cache_file}: {exc}. Price fetch aborted.")
-        return
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                last_run = json.load(f)
+            stocks_list = last_run.get("stocks", [])
+            tickers = [s["Ticker"] for s in stocks_list if "Ticker" in s]
+            logger.info(f"Loaded {len(tickers)} tickers from last_run.json.")
+        except Exception as exc:
+            logger.warning(f"Could not read {cache_file}: {exc} — will fetch universe fresh.")
 
-    stocks_list = last_run.get("stocks", [])
-    if not stocks_list:
-        logger.warning("last_run.json contains no stocks. Price fetch aborted.")
-        return
-
-    tickers = [s["Ticker"] for s in stocks_list if "Ticker" in s]
-    logger.info(f"Loaded {len(tickers)} tickers from last_run.json.")
+    if not tickers:
+        logger.info("No cached ticker list — fetching stock universe from source.")
+        try:
+            from data_fetcher import get_stock_universe
+            tickers = get_stock_universe()
+            logger.info(f"Fetched {len(tickers)} tickers from stock universe.")
+        except Exception as exc:
+            logger.error(f"Could not load stock universe: {exc}. Price fetch aborted.")
+            return
 
     # ------------------------------------------------------------------
     # 3. Fetch closing prices
