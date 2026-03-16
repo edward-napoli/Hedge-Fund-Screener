@@ -244,11 +244,9 @@ def _fetch_closing_price(ticker: str, date_str: str) -> dict:
 
 def fetch_all_closing_prices(tickers: list, date_str: str) -> dict:
     """
-    Fetch closing prices for all tickers on the given date.
-
-    For tickers where price_usd is still None after the primary fetch, a
-    previous-day price from price_history is used as a last-resort fallback
-    (also flagged with fallback=True).
+    Fetch closing prices for all tickers on the given date using a single
+    batch yf.download() call, then fall back to per-ticker fetch for any
+    that are missing, and finally to last known price from history.
 
     Parameters
     ----------
@@ -262,23 +260,86 @@ def fetch_all_closing_prices(tickers: list, date_str: str) -> dict:
     dict
         Mapping ticker → price data dict.
     """
+    import yfinance as yf
+
     results: dict = {}
 
-    for i, ticker in enumerate(tickers):
-        if i > 0 and i % 50 == 0:
-            logger.info(f"Price fetch progress: {i}/{len(tickers)} stocks processed.")
-        results[ticker] = _fetch_closing_price(ticker, date_str)
+    # ------------------------------------------------------------------
+    # Step 1: Batch download all tickers at once (fast — single API call)
+    # ------------------------------------------------------------------
+    next_day = (
+        datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=3)
+    ).strftime("%Y-%m-%d")
 
-    # Last-resort: for tickers still missing price_usd, use most recent historical price
+    logger.info(f"Batch downloading closing prices for {len(tickers)} tickers...")
+    try:
+        batch = yf.download(
+            tickers,
+            start=date_str,
+            end=next_day,
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+        # batch["Close"] is a DataFrame: rows=dates, cols=tickers
+        close_df = batch["Close"] if "Close" in batch.columns.get_level_values(0) else batch
+        if hasattr(close_df, "columns") and hasattr(close_df.columns, "get_level_values"):
+            # Multi-level columns from yf.download
+            if "Close" in batch:
+                close_df = batch["Close"]
+        logger.info(f"Batch download complete: {close_df.shape}")
+    except Exception as exc:
+        logger.warning(f"Batch download failed ({exc}) — falling back to per-ticker fetch.")
+        close_df = pd.DataFrame()
+
+    # Build results from the batch data
+    fetched_via_batch: set = set()
+    if not close_df.empty:
+        # Get the last available row (most recent close)
+        last_row = close_df.iloc[-1]
+        for ticker in tickers:
+            price_local = None
+            if ticker in last_row.index:
+                val = last_row[ticker]
+                if pd.notna(val):
+                    price_local = float(val)
+
+            if price_local is not None:
+                suffix  = _get_suffix(ticker)
+                currency = "USD"
+                fx_rate  = 1.0
+                if suffix:
+                    fx_pair, currency = SUFFIX_TO_FX[suffix]
+                    fetched_rate = _fetch_fx_rate(fx_pair)
+                    fx_rate = fetched_rate if fetched_rate is not None else 1.0
+
+                results[ticker] = {
+                    "price_usd":   round(price_local * fx_rate, 4),
+                    "price_local": round(price_local, 4),
+                    "currency":    currency,
+                    "fallback":    False,
+                    "error":       False,
+                }
+                fetched_via_batch.add(ticker)
+
+    # ------------------------------------------------------------------
+    # Step 2: Per-ticker fallback for anything the batch missed
+    # ------------------------------------------------------------------
+    missing = [t for t in tickers if t not in fetched_via_batch]
+    if missing:
+        logger.info(f"Per-ticker fallback fetch for {len(missing)} stocks...")
+        for ticker in missing:
+            results[ticker] = _fetch_closing_price(ticker, date_str)
+
+    # ------------------------------------------------------------------
+    # Step 3: Last-resort — use most recent historical price from cache
+    # ------------------------------------------------------------------
     existing_history = load_price_history()
+    sorted_dates = sorted(existing_history.keys(), reverse=True)
+
     for ticker, data in results.items():
-        if data.get("price_usd") is None and not data.get("error"):
-            continue
         if data.get("price_usd") is not None:
             continue
-
-        # Walk backwards through history to find last known price
-        sorted_dates = sorted(existing_history.keys(), reverse=True)
         for past_date in sorted_dates:
             if past_date >= date_str:
                 continue
@@ -291,10 +352,6 @@ def fetch_all_closing_prices(tickers: list, date_str: str) -> dict:
                     "fallback":    True,
                     "error":       False,
                 }
-                logger.debug(
-                    f"Used historical fallback for {ticker} "
-                    f"(from {past_date}, price={past_data['price_usd']})."
-                )
                 break
 
     successful = sum(1 for d in results.values() if d.get("price_usd") is not None)
@@ -396,6 +453,7 @@ def run_price_fetch() -> None:
             "Skipping Sheets update."
         )
     else:
+        ss = None
         try:
             from sheets_writer import (
                 _get_client,
@@ -417,11 +475,12 @@ def run_price_fetch() -> None:
         # ------------------------------------------------------------------
         # 6. Run efficacy analysis
         # ------------------------------------------------------------------
-        try:
-            from efficacy_analyzer import run_efficacy_analysis
-            run_efficacy_analysis(ss, credentials_file)  # type: ignore[name-defined]
-        except Exception as exc:
-            logger.error(f"Efficacy analysis failed: {exc}", exc_info=True)
+        if ss is not None:
+            try:
+                from efficacy_analyzer import run_efficacy_analysis
+                run_efficacy_analysis(ss, credentials_file)
+            except Exception as exc:
+                logger.error(f"Efficacy analysis failed: {exc}", exc_info=True)
 
     # ------------------------------------------------------------------
     # 7. Summary log
