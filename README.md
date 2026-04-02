@@ -112,7 +112,13 @@ Missing values default to **0**. Stocks missing more than 8 of 15 metrics are ex
 ├── requirements.txt
 ├── .env.example          # Environment variable template
 ├── .env                  # Local config (git-ignored)
-└── credentials.json      # Google service account key (git-ignored)
+├── credentials.json      # Google service account key (git-ignored)
+└── scripts/
+    ├── setup_windows_task.bat   # Register scheduler as a Windows startup task (run once)
+    ├── register_task.ps1        # PowerShell Task Scheduler XML registration
+    ├── start_scheduler.bat      # Start scheduler as a detached background process
+    ├── stop_scheduler.bat       # Stop the running scheduler via PID file
+    └── scheduler_status.bat     # Show next scheduled run times
 ```
 
 ---
@@ -157,6 +163,23 @@ CREDENTIALS_FILE=credentials.json
 ```bash
 python main.py              # single run
 python main.py --backtest   # backtest mode
+```
+
+### 5. Windows Deployment (optional)
+
+Scripts in `scripts/` automate running the scheduler as a persistent background process on Windows.
+
+**One-time setup — register as a startup task:**
+```bat
+scripts\setup_windows_task.bat
+```
+Registers `HedgeFundScheduler` in Windows Task Scheduler to launch automatically at logon using `pythonw.exe` (no console window). Restarts up to 3 times on failure.
+
+**Manual start/stop (without Task Scheduler):**
+```bat
+scripts\start_scheduler.bat      :: Start scheduler as a detached background process
+scripts\stop_scheduler.bat       :: Stop it (reads PID from logs\scheduler.pid)
+scripts\scheduler_status.bat     :: Show next scheduled run times
 ```
 
 ---
