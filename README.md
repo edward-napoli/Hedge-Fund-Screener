@@ -1,109 +1,52 @@
 # Hedge Fund Global Stock Screener
 
-A Python program that automatically screens **500–2,000+ global stocks**, collects
-21 financial metrics per stock, calculates a proprietary composite score, ranks all
-stocks, and logs everything to Google Sheets with rich formatting.
+A quantitative equity screening and ranking system that evaluates 500–2,000+ global stocks across 11 major indices, scores them via a proprietary composite formula, and delivers ranked output to Google Sheets with automated scheduling, Slack alerting, and run validation.
+
+Built independently as a personal project to understand how systematic investment processes work in practice.
 
 ---
 
-## Features
-
-| Feature | Details |
-|---------|---------|
-| **Universe** | S&P 500, NASDAQ-100, Russell 1000 + FTSE 100, DAX 40, CAC 40, Nikkei 225, TSX, ASX 200, Hang Seng, Eurostoxx |
-| **Metrics** | P/E, P/B, Net Income, EPS growth (1/3/5yr + forward), ROA, ROE, ROIC, Dividend Yield, Payout Ratio, Current Ratio, Altman Z-Score, Piotroski F-Score |
-| **Scoring** | Custom composite formula with 12 weighted factors |
-| **Google Sheets** | Dated tab, frozen header, alternating rows, gradient score colours, gold top-10 highlight, auto-sized columns, Summary tab |
-| **Performance** | Parallel fetching (10 workers), retry with exponential back-off, tqdm progress bar, rate limiting |
-| **Resilience** | CSV backup before Sheets write; graceful handling of missing data |
-
----
-
-## Quick Start
-
-### 1. Install Python dependencies
-
-```bash
-pip install -r requirements.txt
+## System Architecture
 ```
-
-### 2. Set up Google Sheets API credentials
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project (or select an existing one)
-3. Enable the **Google Sheets API** and **Google Drive API**
-   - APIs & Services → Enable APIs → search "Google Sheets API" → Enable
-   - Repeat for "Google Drive API"
-4. Create a **Service Account**
-   - APIs & Services → Credentials → Create Credentials → Service Account
-   - Give it a name (e.g. `stock-screener`)
-   - Click Done
-5. Generate a JSON key for the service account
-   - Click the service account → Keys → Add Key → Create new key → JSON
-   - Save the downloaded file as **`credentials.json`** in the project root
-6. Share your target Google Sheet with the service account email
-   - Open your Google Sheet
-   - Share → paste the service account email (e.g. `stock-screener@my-project.iam.gserviceaccount.com`)
-   - Give **Editor** access
-
-### 3. Configure environment variables
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```env
-# Paste your Google Sheet ID from the URL:
-# https://docs.google.com/spreadsheets/d/<SHEET_ID>/edit
-GOOGLE_SHEET_ID=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms
-
-# Path to your service account credentials file
-CREDENTIALS_FILE=credentials.json
-```
-
-> **Tip:** Leave `GOOGLE_SHEET_ID` empty on first run — the script will
-> automatically create a new spreadsheet and print its URL.
-
-### 4. Run the screener
-
-```bash
-python main.py
-```
-
-**Expected console output:**
-```
-[INFO] Loading stock universe... 1,247 stocks found
-[INFO] Fetching financial data... ████████░░ 78% (974/1247)
-[INFO] Calculating composite scores...
-[INFO] Writing to Google Sheets...
-[INFO] ✅ Done! 1,103 stocks ranked. Top stock: BRK-B (Score: 487.3)
-[INFO] Sheet URL: https://docs.google.com/spreadsheets/d/...
+Universe Definition (config.py)
+         ↓
+Data Fetching — parallel (10 workers), retry + exponential back-off (data_fetcher.py)
+         ↓
+Score Calculation — 12-factor composite formula (scorer.py)
+         ↓
+        ├── Google Sheets output — gradient formatting, summary tab (sheets_writer.py)
+        ├── CSV backup — local ranked data
+        └── Delta tracking — top-25 entry/exit detection (delta_tracker.py)
+         ↓
+Scheduler — twice-daily on weekdays, dynamic UTC from market hours (scheduler.py)
+         ↓
+        ├── Slack alerts — startup, run summary, validation warnings (alerts.py)
+        ├── Price tracking — live prices for top holdings (price_tracker.py)
+        └── Efficacy analysis — ranking predictive accuracy over time (efficacy_analyzer.py)
 ```
 
 ---
 
-## Project Structure
+## Design Decisions
 
-```
-Hedge Fund Project/
-├── main.py            # Entry point — orchestration
-├── data_fetcher.py    # Fetching logic (yfinance, yahooquery, calculated scores)
-├── scorer.py          # Composite score formula and ranking
-├── sheets_writer.py   # Google Sheets writing and formatting
-├── config.py          # Constants, weights, ticker universe lists
-├── requirements.txt
-├── .env.example       # Template for environment variables
-├── .env               # Your local config (git-ignored)
-├── credentials.json   # Service account key (git-ignored — keep secret!)
-└── errors.log         # Auto-generated error log
-```
+**Why a composite score rather than a single metric?**
+No single financial ratio reliably predicts outperformance across market cycles. The composite combines quality (ROIC, ROE, ROA), growth (EPS CAGR, forward estimates), safety (Altman Z-Score, Current Ratio), value (P/E, P/B, dividend yield), and financial health (Piotroski F-Score) to produce a multidimensional ranking.
+
+**Why weight Altman Z-Score (3.25×) and Piotroski F-Score (2.65×) so heavily?**
+Both are proven multi-factor models with strong academic backing for predicting financial distress and earnings quality respectively. They act as quality gates — a stock can score well on growth and value metrics but still rank poorly if its balance sheet signals distress.
+
+**Why exclude stocks with more than 8 of 15 metrics missing?**
+Stocks with sparse data produce unreliable composite scores. The 8/15 threshold was calibrated to exclude stocks where missing data would meaningfully distort the ranking while retaining the majority of international equities that have partial coverage.
+
+**Why parallel fetching with 10 workers?**
+Sequential fetching of 1,200+ stocks from the Yahoo Finance API takes ~40 minutes. Parallel fetching with rate limiting and exponential back-off reduces this to ~4 minutes while avoiding API bans.
+
+**Why a dynamic scheduler rather than fixed cron times?**
+Market open and close times vary by exchange and shift with Daylight Saving Time. The scheduler calculates run times dynamically in UTC each day from real market hours, so the morning run always fires shortly after the earliest market opens (HKEX ~01:30 UTC) and the afternoon run after the earliest close (TSE ~06:30 UTC).
 
 ---
 
 ## Composite Score Formula
-
 ```
 Score = 0.3(E₁) + 0.8(E₃) + 1.4(E₅) + 2.5(Ef)
       + Ra + Re + 2(Rc)
@@ -111,26 +54,110 @@ Score = 0.3(E₁) + 0.8(E₃) + 1.4(E₅) + 2.5(Ef)
       + 3.25 × (Y×(2 − Pr/100) − (5×Pe + 3×Pb))
 ```
 
-| Symbol | Metric | Unit |
-|--------|--------|------|
-| E₁ | 1-Year EPS Growth | % (e.g. 15) |
-| E₃ | 3-Year EPS CAGR | % |
-| E₅ | 5-Year EPS CAGR | % |
-| Ef | Forward EPS Growth Estimate | % |
-| Ra | Return on Assets | % |
-| Re | Return on Equity | % |
-| Rc | Return on Invested Capital | % |
-| C  | Current Ratio | raw ratio |
-| Z  | Altman Z-Score | raw |
-| F  | Piotroski F-Score | 0–9 |
-| A  | Annual Net Income | USD millions |
-| Y  | Dividend Yield | % |
-| Pr | Payout Ratio | % |
-| Pe | P/E Ratio | raw |
-| Pb | P/B Ratio | raw |
+| Symbol | Metric | Weight Rationale |
+|--------|--------|-----------------|
+| E₁ | 1-Year EPS Growth | Recent momentum, low weight to avoid noise |
+| E₃ | 3-Year EPS CAGR | Medium-term growth quality |
+| E₅ | 5-Year EPS CAGR | Sustained compounding ability |
+| Ef | Forward EPS Growth | Market consensus on future trajectory |
+| Ra | Return on Assets | Capital efficiency |
+| Re | Return on Equity | Shareholder return generation |
+| Rc | Return on Invested Capital | Best single measure of business quality (2× weight) |
+| C | Current Ratio | Short-term liquidity |
+| Z | Altman Z-Score | Bankruptcy risk (highest single weight) |
+| F | Piotroski F-Score | 9-point financial health composite |
+| A | Annual Net Income | Absolute profitability anchor |
+| Y | Dividend Yield | Income, adjusted by payout sustainability |
+| Pr | Payout Ratio | Dividend safety check |
+| Pe | P/E Ratio | Valuation (penalised) |
+| Pb | P/B Ratio | Asset valuation (penalised) |
 
-Missing values default to **0** in the formula (never crash).
-Stocks with **more than 8 of 15 metrics missing** are excluded entirely.
+Missing values default to **0**. Stocks missing more than 8 of 15 metrics are excluded entirely.
+
+---
+
+## Stock Universe
+
+| Index | Region |
+|-------|--------|
+| S&P 500, NASDAQ-100, Russell 1000 | United States |
+| FTSE 100 | United Kingdom |
+| DAX 40 | Germany |
+| CAC 40 | France |
+| Nikkei 225 | Japan |
+| TSX | Canada |
+| ASX 200 | Australia |
+| Hang Seng | Hong Kong |
+| Eurostoxx | Europe |
+
+---
+
+## File Structure
+```
+├── main.py               # Entry point and CLI
+├── config.py             # Weights, universe lists, constants
+├── data_fetcher.py       # yfinance/yahooquery fetching, Altman Z, Piotroski F, ROIC
+├── scorer.py             # Composite formula and ranking logic
+├── sheets_writer.py      # Google Sheets output and formatting
+├── scheduler.py          # APScheduler daemon, dynamic market-hour timing
+├── alerts.py             # Slack notifications (startup, runs, validation warnings)
+├── delta_tracker.py      # Top-25 entry/exit change detection between runs
+├── price_tracker.py      # Live price tracking for top holdings
+├── efficacy_analyzer.py  # Ranking predictive accuracy analysis
+├── backtest.py           # Historical backtesting against scored rankings
+├── weight_optimizer.py   # Score weight tuning via historical performance
+├── factor_analysis.py    # Per-factor contribution and correlation analysis
+├── stress_test.py        # Portfolio stress testing under historical scenarios
+├── historical_data.py    # Historical price/metric data retrieval utilities
+├── requirements.txt
+├── .env.example          # Environment variable template
+├── .env                  # Local config (git-ignored)
+└── credentials.json      # Google service account key (git-ignored)
+```
+
+---
+
+## Run Validation
+
+After each live run the system automatically checks:
+1. At least 400 stocks scored (flags partial run if fewer)
+2. Top-25 average rank shift ≤ 15 positions vs previous run (detects data errors)
+3. No stock score is > 5 standard deviations from the mean (outlier detection)
+
+Failures are logged to `errors.log` and trigger a Slack alert.
+
+---
+
+## Quick Start
+
+### 1. Install dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Set up Google Sheets API credentials
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Enable the **Google Sheets API** and **Google Drive API**
+3. Create a **Service Account** and download the JSON key
+4. Save the key as `credentials.json` in the project root
+5. Share your Google Sheet with the service account email (Editor access)
+
+### 3. Configure environment variables
+```bash
+cp .env.example .env
+```
+
+Edit `.env`:
+```env
+GOOGLE_SHEET_ID=your_sheet_id_here   # leave blank to auto-create
+CREDENTIALS_FILE=credentials.json
+```
+
+### 4. Run
+```bash
+python main.py              # single run
+python main.py --backtest   # backtest mode
+```
 
 ---
 
@@ -138,59 +165,19 @@ Stocks with **more than 8 of 15 metrics missing** are excluded entirely.
 
 | Source | Used For |
 |--------|----------|
-| `yfinance` | P/E, P/B, ROA, ROE, net income, dividend yield, payout ratio, current ratio, earnings history, balance sheet, income statement, cash flow |
+| `yfinance` | P/E, P/B, ROA, ROE, net income, dividend yield, payout ratio, current ratio, earnings history |
 | `yahooquery` | Forward EPS growth estimates (fallback) |
 | In-house calculation | ROIC, Altman Z-Score, Piotroski F-Score, 3yr/5yr EPS CAGR |
 | Wikipedia (pandas HTML) | S&P 500, NASDAQ-100, Russell 1000 ticker lists |
 
 ---
 
-## Google Sheet Layout
+## Security
 
-**Main tab** (`Stock Screener YYYY-MM-DD`):
-- Row 1: Bold white text on navy (`#1a237e`) — frozen
-- Alternating white / light-grey rows
-- Composite Score: red→white→green gradient
-- Ranks 1–10: gold background + bold
-- All columns auto-sized
-
-**Summary tab**:
-- Total stocks screened / skipped / ranked
-- Date & time of last run
-- Top 25 stocks (ticker, name, score, rank)
-- Average composite score
-- Sector breakdown of top 100
-
----
-
-## Output Files
-
-| File | Description |
-|------|-------------|
-| `stock_screener_YYYY-MM-DD.csv` | Local backup of all ranked data |
-| `errors.log` | Per-stock fetch errors and warnings |
-
----
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| `FileNotFoundError: credentials.json` | Download your service account JSON key and rename it `credentials.json` |
-| `SpreadsheetNotFound` | Share the sheet with your service account email, or leave `GOOGLE_SHEET_ID` blank to auto-create |
-| Very few stocks returned | yfinance rate limits — re-run after a few minutes; the script already retries 3× with back-off |
-| `No module named 'yahooquery'` | Run `pip install yahooquery` |
-| International stocks missing data | Expected — many non-US stocks have limited free data; they score with 0 on missing fields |
-
----
-
-## Security Notes
-
-- **Never commit `credentials.json` or `.env`** to version control.
-- Add them to `.gitignore`:
-  ```
-  credentials.json
-  .env
-  *.log
-  *.csv
-  ```
+Never commit `credentials.json` or `.env`. Both are git-ignored by default.
+```
+credentials.json
+.env
+*.log
+*.csv
+```
