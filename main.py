@@ -204,6 +204,80 @@ def _append_run_history(entry: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Run validation
+# ---------------------------------------------------------------------------
+
+_ERRORS_LOG = "logs/errors.log"
+
+
+def _validate_run(df: "pd.DataFrame", is_partial: bool) -> list:
+    """
+    Validate data quality after each screener run.
+
+    Checks
+    ------
+    1. At least PARTIAL_RUN_THRESHOLD stocks scored (covered by is_partial).
+    2. Top-25 rank shifts no more than 15 positions on average vs previous run.
+    3. No stock's Composite Score is more than 5 standard deviations from mean.
+
+    Returns a list of warning strings (empty = all clear).
+    Failures are also written to logs/errors.log.
+    """
+    import math
+
+    warnings: list = []
+
+    # Check 1: partial run
+    if is_partial:
+        msg = (
+            f"Partial run: {len(df)} stocks scored "
+            f"(threshold: {PARTIAL_RUN_THRESHOLD})"
+        )
+        warnings.append(msg)
+
+    # Check 2: large top-25 rank shift (>15 positions average)
+    if "Rank Delta" in df.columns and not df.empty:
+        top25_deltas = df.head(25)["Rank Delta"].dropna()
+        if not top25_deltas.empty:
+            avg_shift = float(top25_deltas.abs().mean())
+            if avg_shift > 15:
+                msg = (
+                    f"Large top-25 rank shift: avg {avg_shift:.1f} positions "
+                    "(threshold: 15) — possible data error"
+                )
+                warnings.append(msg)
+
+    # Check 3: score outliers (>5 std from mean)
+    if "Composite Score" in df.columns and len(df) > 10:
+        scores = df["Composite Score"].dropna()
+        mean_s = float(scores.mean())
+        std_s  = float(scores.std())
+        if std_s > 0:
+            outliers = df[
+                (df["Composite Score"] - mean_s).abs() > 5 * std_s
+            ]["Ticker"].tolist()
+            if outliers:
+                sample = [str(t) for t in outliers[:10]]
+                msg = (
+                    f"Score outliers (>5 std from mean={mean_s:.1f}, "
+                    f"std={std_s:.1f}): {', '.join(sample)}"
+                )
+                warnings.append(msg)
+
+    # Write failures to errors.log
+    if warnings:
+        try:
+            with open(_ERRORS_LOG, "a", encoding="utf-8") as f:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                for w in warnings:
+                    f.write(f"{ts} [VALIDATION] {w}\n")
+        except Exception as exc:
+            logger.warning(f"Could not write validation failures to errors.log: {exc}")
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
 # Core run logic
 # ---------------------------------------------------------------------------
 
@@ -303,6 +377,19 @@ def _do_run(run_type: str) -> dict:
         )
 
     # ------------------------------------------------------------------
+    # 7b. Run validation (outliers, rank shifts, coverage)
+    # ------------------------------------------------------------------
+    validation_warnings = _validate_run(df, is_partial)
+    if validation_warnings:
+        for w in validation_warnings:
+            logger.warning(f"[VALIDATION] {w}")
+        try:
+            from alerts import send_slack_validation_alert
+            send_slack_validation_alert(validation_warnings)
+        except Exception as exc:
+            logger.error(f"Could not send validation Slack alert: {exc}")
+
+    # ------------------------------------------------------------------
     # 8. CSV backup
     # ------------------------------------------------------------------
     csv_file = _save_csv(df, run_type)
@@ -319,6 +406,30 @@ def _do_run(run_type: str) -> dict:
         logger.info(f"Exited top 25:  {top25_changes['exited']}")
     if top25_changes["big_movers"]:
         logger.info(f"Big movers:     {top25_changes['big_movers']}")
+
+    # ------------------------------------------------------------------
+    # 9b. Market regime detection (SPY 200-day MA filter)
+    # ------------------------------------------------------------------
+    regime_label = "UNKNOWN"
+    try:
+        from backtest import is_risk_on, fetch_spy_prices
+        spy_series = fetch_spy_prices()
+        if spy_series is not None:
+            risk_on = is_risk_on(spy_series, datetime.now().date())
+            regime_label = "RISK-ON" if risk_on else "RISK-OFF"
+        else:
+            regime_label = "RISK-ON (no SPY data)"
+    except Exception as exc:
+        logger.warning(f"Regime detection failed: {exc}")
+        regime_label = "UNKNOWN"
+
+    weighting_scheme = os.getenv("WEIGHTING_SCHEME", "risk_parity")
+    regime_filter_on = os.getenv("REGIME_FILTER", "true").lower() == "true"
+    print(
+        f"[INFO] Market Regime: {regime_label}  |  "
+        f"Weighting: {weighting_scheme}  |  "
+        f"Regime filter: {'ON' if regime_filter_on else 'OFF'}"
+    )
 
     # ------------------------------------------------------------------
     # 10. Google Sheets
@@ -346,6 +457,8 @@ def _do_run(run_type: str) -> dict:
                 run_type=run_type,
                 is_partial=is_partial,
                 top25_changes=top25_changes,
+                regime_label=regime_label,
+                weighting_scheme=weighting_scheme,
             )
         except Exception as exc:
             logger.error(f"Google Sheets write failed: {exc}", exc_info=True)
@@ -370,6 +483,7 @@ def _do_run(run_type: str) -> dict:
             elapsed_seconds=elapsed,
             sheet_url=sheet_url,
             is_partial=is_partial,
+            validation_warnings=validation_warnings,
         )
     except Exception as exc:
         logger.error(f"Slack alert error: {exc}")
@@ -402,13 +516,15 @@ def _do_run(run_type: str) -> dict:
     # 14. Build and return metadata dict
     # ------------------------------------------------------------------
     return {
-        "timestamp":      timestamp,
-        "run_type":       run_type,
-        "duration_s":     round(elapsed, 1),
-        "stocks_fetched": total_found,
-        "stocks_skipped": total_skipped,
-        "errors":         error_count,
-        "is_partial":     is_partial,
+        "timestamp":        timestamp,
+        "run_type":         run_type,
+        "duration_s":       round(elapsed, 1),
+        "stocks_fetched":   total_found,
+        "stocks_skipped":   total_skipped,
+        "errors":           error_count,
+        "is_partial":       is_partial,
+        "regime":           regime_label,
+        "weighting_scheme": weighting_scheme,
         "top10": [
             {
                 "ticker": str(row["Ticker"]),
@@ -464,6 +580,409 @@ def run_screener(run_type: str = "morning") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Backtesting / analysis CLI handlers
+# ---------------------------------------------------------------------------
+
+def _cmd_fetch_history(args) -> None:
+    """Bootstrap 10-year historical data."""
+    from data_fetcher import get_stock_universe
+    from historical_data import bootstrap_historical_data, print_coverage_report
+    tickers = get_stock_universe()
+    print(f"[INFO] Fetching 10-year history for {len(tickers):,} tickers...")
+    bootstrap_historical_data(tickers, force_refresh=args.force)
+    print_coverage_report()
+
+
+def _cmd_coverage_report(_args) -> None:
+    from historical_data import print_coverage_report
+    print_coverage_report()
+
+
+def _cmd_diagnose_zf(_args) -> None:
+    from historical_data import print_zf_diagnostic
+    print_zf_diagnostic()
+
+
+def _cmd_backtest(args) -> None:
+    """Run Clayton Score backtest and optionally write to Sheets."""
+    from historical_data import load_all_fundamentals, load_all_prices
+    from backtest import (
+        run_backtest, run_comparison_backtest,
+        print_backtest_summary, print_comparison_table,
+        save_backtest_results, fetch_spy_prices,
+        BACKTEST_START, BACKTEST_END,
+        DEFAULT_WEIGHTING, DEFAULT_REGIME_FILTER,
+        DEFAULT_CASH_FRACTION, DEFAULT_VOL_LOOKBACK, DEFAULT_MAX_SINGLE_POS,
+    )
+    from weight_optimizer import get_active_weights, check_weights_staleness
+
+    # Warn if cached weights are older than the most recent backtest results
+    stale_warning = check_weights_staleness()
+    if stale_warning:
+        print(stale_warning)
+
+    weights = get_active_weights()
+    print("[INFO] Loading historical data...")
+    fund_all = load_all_fundamentals()
+    prices   = load_all_prices()
+    spy      = fetch_spy_prices(start=BACKTEST_START, end=BACKTEST_END)
+
+    if not fund_all:
+        print("[ERROR] No historical data found. Run: python main.py --fetch-history")
+        return
+
+    # Resolve weighting / regime from CLI flags → .env defaults
+    weighting = getattr(args, "weighting", DEFAULT_WEIGHTING) or DEFAULT_WEIGHTING
+    use_regime = not getattr(args, "no_regime_filter", False)
+    if getattr(args, "regime_filter", False):
+        use_regime = True
+
+    comparison = getattr(args, "comparison", False)
+
+    common_kwargs = dict(
+        fundamentals_panel=fund_all,
+        prices=prices,
+        weights=weights,
+        top_n=args.top_n,
+        freq=args.rebalance,
+        tc_bps=args.tc_bps,
+        risk_free=DEFAULT_RISK_FREE if hasattr(args, "risk_free") else float(os.getenv("RISK_FREE_RATE", "0.04")),
+        start=BACKTEST_START,
+        end=BACKTEST_END,
+        spy_prices=spy,
+        cash_fraction=DEFAULT_CASH_FRACTION,
+        vol_lookback=DEFAULT_VOL_LOOKBACK,
+        max_single_pos=DEFAULT_MAX_SINGLE_POS,
+    )
+
+    if comparison:
+        print("[INFO] Running all 4 strategy variants for comparison...")
+        comp_results = run_comparison_backtest(**common_kwargs)
+        print_comparison_table(comp_results)
+        _write_backtest_to_sheets(comparison_results=comp_results)
+        # Also save each variant individually
+        for variant_name, res in comp_results.items():
+            label = variant_name.lower().replace(" ", "_").replace(",", "")
+            save_backtest_results(res, label=label)
+        print("[INFO] All 4 variant results saved to cache/backtest/")
+    else:
+        print(
+            f"[INFO] Running backtest ({args.rebalance}, top-{args.top_n}, "
+            f"weighting={weighting}, regime_filter={use_regime})..."
+        )
+        results = run_backtest(
+            **common_kwargs,
+            long_short=args.long_short,
+            weighting_scheme=weighting,
+            regime_filter=use_regime,
+        )
+        print_backtest_summary(results)
+        label = f"{args.rebalance}_top{args.top_n}_{weighting}"
+        path  = save_backtest_results(results, label=label)
+        print(f"[INFO] Results saved to {path}")
+        _write_backtest_to_sheets(backtest_results=results)
+
+
+def _cmd_optimize(args) -> None:
+    """Run walk-forward weight optimisation."""
+    import os as _os
+    from historical_data import load_all_fundamentals, load_all_prices
+    from weight_optimizer import (
+        walk_forward_optimise, print_wf_summary,
+        OPTIMAL_WEIGHTS_FILE, check_weights_staleness,
+    )
+    from backtest import BACKTEST_START, BACKTEST_END
+
+    # --force: delete cached weights so optimisation truly starts from scratch
+    if getattr(args, "force", False):
+        if _os.path.exists(OPTIMAL_WEIGHTS_FILE):
+            _os.remove(OPTIMAL_WEIGHTS_FILE)
+            print(f"[INFO] --force: deleted cached weights ({OPTIMAL_WEIGHTS_FILE}). "
+                  f"Running full optimisation from scratch.")
+        else:
+            print("[INFO] --force: no cached weights file found, nothing to clear.")
+
+    # Resolve popsize/maxiter from speed flag, then manual overrides
+    if getattr(args, "optimize_fast", False):
+        popsize, maxiter = 5, 30
+    elif getattr(args, "optimize_full", False):
+        popsize, maxiter = 12, 80
+    else:
+        popsize, maxiter = 8, 50
+    if args.popsize is not None:
+        popsize = args.popsize
+    if args.maxiter is not None:
+        maxiter = args.maxiter
+
+    print(f"[INFO] Loading historical data...")
+    fund_all = load_all_fundamentals()
+    prices   = load_all_prices()
+
+    if not fund_all:
+        print("[ERROR] No historical data found. Run: python main.py --fetch-history")
+        return
+
+    print(
+        f"[INFO] Walk-forward optimisation — "
+        f"train={args.train_years}yr, test={args.test_years}yr, "
+        f"popsize={popsize}, maxiter={maxiter}"
+    )
+    results = walk_forward_optimise(
+        fundamentals_panel=fund_all,
+        prices=prices,
+        universe_start=BACKTEST_START,
+        universe_end=BACKTEST_END,
+        train_years=args.train_years,
+        test_years=args.test_years,
+        step_years=args.step_years,
+        top_n=args.top_n,
+        popsize=popsize,
+        maxiter=maxiter,
+    )
+
+    print_wf_summary(results)
+
+    if args.write_sheets:
+        _write_backtest_to_sheets(wf_results=results)
+
+
+def _cmd_factor_analysis(args) -> None:
+    """Run factor contribution and IC analysis."""
+    from historical_data import load_all_fundamentals, load_all_prices
+    from factor_analysis import run_factor_analysis, print_factor_summary, save_factor_results
+    from weight_optimizer import get_active_weights
+
+    fund_all   = load_all_fundamentals()
+    fund_panel = {t: d.get("records", []) for t, d in fund_all.items()}
+    prices     = load_all_prices()
+
+    if not fund_panel:
+        print("[ERROR] No historical data found. Run: python main.py --fetch-history")
+        return
+
+    print("[INFO] Running factor analysis...")
+    results = run_factor_analysis(
+        prices=prices,
+        fundamentals_panel=fund_panel,
+        weights=get_active_weights(),
+        horizons=args.horizons,
+        top_n=args.top_n,
+    )
+
+    print_factor_summary(results)
+    save_factor_results(results)
+
+    if args.write_sheets:
+        _write_backtest_to_sheets(factor_results=results)
+
+
+def _cmd_stress_test(args) -> None:
+    """Run stress tests and Monte Carlo simulation."""
+    from historical_data import load_all_fundamentals, load_all_prices, load_prices
+    from stress_test import run_all_stress_tests, print_stress_summary, save_stress_results
+    from weight_optimizer import get_active_weights
+
+    fund_all   = load_all_fundamentals()
+    fund_panel = {t: d.get("records", []) for t, d in fund_all.items()}
+    prices     = load_all_prices()
+    spy        = load_prices("SPY")
+
+    if not fund_panel:
+        print("[ERROR] No historical data found. Run: python main.py --fetch-history")
+        return
+
+    print(f"[INFO] Running stress tests ({args.mc_runs} MC runs)...")
+    results = run_all_stress_tests(
+        fundamentals_panel=fund_panel,
+        prices=prices,
+        weights=get_active_weights(),
+        top_n=args.top_n,
+        tc_bps=args.tc_bps,
+        mc_runs=args.mc_runs,
+        spy_prices=spy,
+    )
+
+    print_stress_summary(results)
+    save_stress_results(results)
+
+    if args.write_sheets:
+        _write_backtest_to_sheets(stress_results=results)
+
+
+def _write_backtest_to_sheets(
+    backtest_results=None,
+    wf_results=None,
+    stress_results=None,
+    factor_results=None,
+    comparison_results=None,
+) -> None:
+    """Write whichever results are available to the Backtest Results tab."""
+    from sheets_writer import write_backtest_tab
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    sheet_id      = os.getenv("GOOGLE_SHEET_ID", "").strip() or None
+    credentials_f = os.getenv("CREDENTIALS_FILE", "credentials.json")
+
+    if not os.path.exists(credentials_f):
+        logger.warning("No credentials file found at '%s' — skipping Backtest Results tab write.", credentials_f)
+        return
+
+    if not sheet_id:
+        logger.warning("GOOGLE_SHEET_ID not set — skipping Backtest Results tab write.")
+        return
+
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(credentials_f, scopes=scopes)
+        gc    = gspread.authorize(creds)
+        ss    = gc.open_by_key(sheet_id)
+        write_backtest_tab(
+            ss,
+            backtest_results=backtest_results,
+            wf_results=wf_results,
+            stress_results=stress_results,
+            factor_results=factor_results,
+            comparison_results=comparison_results,
+        )
+        logger.info("Backtest Results tab successfully written: %s", ss.url)
+        print(f"[INFO] Backtest Results tab updated: {ss.url}")
+    except Exception as exc:
+        logger.error("Backtest Results tab write failed: %s", exc, exc_info=True)
+        print(f"[ERROR] Backtest Results tab write failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Live status and scheduler status CLI commands
+# ---------------------------------------------------------------------------
+
+def _cmd_live_status(_args) -> None:
+    """Show live data accumulation progress from run_history.json."""
+    history: list = []
+    if os.path.exists(RUN_HISTORY_FILE):
+        try:
+            with open(RUN_HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except Exception as exc:
+            print(f"[ERROR] Could not read {RUN_HISTORY_FILE}: {exc}")
+            return
+
+    successful = [
+        r for r in history
+        if r.get("status") != "FAILED" and r.get("stocks_fetched")
+    ]
+
+    if not successful:
+        print("\n[INFO] No successful live runs recorded yet.")
+        print(f"       Start the scheduler with start_scheduler.bat, or run:\n"
+              f"       python main.py\n")
+        return
+
+    # Unique trading days (by date prefix of timestamp)
+    trading_days = sorted({r["timestamp"][:10] for r in successful if r.get("timestamp")})
+    n_days       = len(trading_days)
+    first_run    = trading_days[0]
+    last_run     = trading_days[-1]
+
+    # Most recent run metadata (latest timestamp)
+    last_meta   = max(successful, key=lambda r: r.get("timestamp", ""))
+    n_stocks    = last_meta.get("stocks_fetched", 0)
+    top5        = last_meta.get("top10", [])[:5]
+    regime      = last_meta.get("regime", "unknown")
+
+    days_to_21  = max(0, 21 - n_days)
+    days_to_63  = max(0, 63 - n_days)
+
+    print("\n" + "=" * 58)
+    print("  LIVE DATA ACCUMULATION STATUS")
+    print("=" * 58)
+    print(f"  Live trading days recorded:  {n_days}")
+    print(f"  Stocks tracked (last run):   {n_stocks:,}")
+    print(f"  First live run:              {first_run}")
+    print(f"  Most recent run:             {last_run}")
+    print(f"  Market regime (last run):    {regime}")
+    print()
+    if days_to_21 > 0:
+        print(f"  Days to 21-day threshold:    {days_to_21}  (efficacy analysis unlocks)")
+    else:
+        print(f"  Efficacy analysis:           UNLOCKED (>= 21 days)")
+    if days_to_63 > 0:
+        print(f"  Days to 63-day threshold:    {days_to_63}  (backtest validation unlocks)")
+    else:
+        print(f"  Backtest validation:         UNLOCKED (>= 63 days)")
+    print()
+    print("  Top 5 by Clayton Score (most recent run):")
+    for i, stock in enumerate(top5, 1):
+        print(f"    {i}. {str(stock.get('ticker','?')):<8}  Score: {stock.get('score', 0):,.2f}")
+    print("=" * 58 + "\n")
+
+
+def _cmd_scheduler_status(_args) -> None:
+    """Show scheduler process status and last 10 log lines."""
+    import subprocess
+
+    log_file = os.path.join("logs", "scheduler.log")
+    pid_file = os.path.join("logs", "scheduler.pid")
+
+    # ── Check if process is running via PID file ─────────────────────
+    proc_running = False
+    running_pid  = None
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r", encoding="utf-8") as f:
+                pid_str = f.read().strip()
+            if pid_str.isdigit():
+                running_pid = int(pid_str)
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {running_pid}", "/FO", "CSV"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                proc_running = str(running_pid) in result.stdout
+        except Exception:
+            pass
+
+    status_label = f"RUNNING (PID {running_pid})" if proc_running else "NOT RUNNING"
+    print(f"\n[INFO] Scheduler process: {status_label}")
+
+    # ── Last 10 log lines ────────────────────────────────────────────
+    print(f"\n[INFO] Last 10 lines of {log_file}:")
+    print("-" * 65)
+    if os.path.exists(log_file):
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in lines[-10:]:
+                print(line.rstrip())
+        except Exception as exc:
+            print(f"[ERROR] Could not read log file: {exc}")
+    else:
+        print("  (log file not found — scheduler has not been started yet)")
+    print("-" * 65)
+
+    # ── Today's scheduled times ──────────────────────────────────────
+    try:
+        from scheduler import _get_schedule_times, _should_run
+        from datetime import date as _date
+        today = _date.today()
+        m, a, p = _get_schedule_times(today)
+        runs_today = _should_run(today)
+        market_status = "MARKET OPEN" if runs_today else "MARKET CLOSED / HOLIDAY"
+        print(f"\n[INFO] Today's schedule ({today}) - {market_status}:")
+        print(f"  Morning run:    {m.strftime('%H:%M UTC')}")
+        print(f"  Afternoon run:  {a.strftime('%H:%M UTC')}")
+        print(f"  Price fetch:    {p.strftime('%H:%M UTC')}")
+    except Exception as exc:
+        print(f"[WARN] Could not compute next run times: {exc}")
+
+    if not proc_running:
+        print("\n  To start: start_scheduler.bat  (or: python scheduler.py)")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -473,15 +992,94 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python main.py\n"
-            "  python main.py --run-type afternoon\n"
+            "  python main.py                              # morning screener run\n"
+            "  python main.py --run-type afternoon         # afternoon run\n"
+            "  python main.py --fetch-history              # bootstrap 10yr data\n"
+            "  python main.py --coverage-report            # data coverage stats\n"
+            "  python main.py --backtest                   # run backtest\n"
+            "  python main.py --backtest --write-sheets    # backtest + Sheets tab\n"
+            "  python main.py --optimize-fast              # quick weight opt (~mins)\n"
+            "  python main.py --optimize                   # standard weight opt\n"
+            "  python main.py --optimize-full              # thorough weight opt (~hrs)\n"
+            "  python main.py --factor-analysis            # factor IC + LOO analysis\n"
+            "  python main.py --stress-test                # stress tests + Monte Carlo\n"
         ),
     )
+
+    # Screener mode
     parser.add_argument(
         "--run-type",
         choices=["morning", "afternoon"],
         default="morning",
-        help="Which run to execute (default: morning)",
+        help="Screener run type (default: morning)",
     )
+
+    # Historical data
+    parser.add_argument("--fetch-history",    action="store_true", help="Bootstrap 10-year historical data")
+    parser.add_argument("--coverage-report",  action="store_true", help="Print data coverage stats")
+    parser.add_argument("--diagnose-zf",      action="store_true", help="Print Altman Z / Piotroski F diagnostic")
+    parser.add_argument("--force",            action="store_true", help="Force re-fetch / ignore cached weights (--fetch-history, --optimize*)")
+
+    # Live status / scheduler status
+    parser.add_argument("--live-status",      action="store_true", help="Show live data accumulation progress")
+    parser.add_argument("--scheduler-status", action="store_true", help="Show scheduler process status and next run times")
+
+    # Backtesting
+    parser.add_argument("--backtest",       action="store_true", help="Run Clayton Score backtest")
+    parser.add_argument("--comparison",     action="store_true", help="Run all 4 strategy variants side-by-side")
+    parser.add_argument("--rebalance",      default="monthly",   choices=["monthly", "weekly", "daily"])
+    parser.add_argument("--top-n",          type=int, default=int(os.getenv("BACKTEST_TOP_N", "25")))
+    parser.add_argument("--tc-bps",         type=float, default=float(os.getenv("TRANSACTION_COST_BPS", "10")))
+    parser.add_argument("--long-short",     action="store_true", help="Long-short variant")
+    parser.add_argument("--write-sheets",   action="store_true", help="Write results to Backtest Results tab")
+    # Weighting and regime
+    parser.add_argument("--weighting",      default=None,        choices=["equal", "risk_parity"],
+                        help="Position sizing: equal or risk_parity (default: from WEIGHTING_SCHEME env)")
+    _regime_grp = parser.add_mutually_exclusive_group()
+    _regime_grp.add_argument("--regime-filter",    dest="regime_filter",    action="store_true",
+                             help="Enable SPY 200-day MA regime filter")
+    _regime_grp.add_argument("--no-regime-filter", dest="no_regime_filter", action="store_true",
+                             help="Disable SPY 200-day MA regime filter")
+
+    # Optimisation — three speed tiers
+    parser.add_argument("--optimize",        action="store_true", help="Walk-forward optimisation (popsize=8, maxiter=50)")
+    parser.add_argument("--optimize-fast",   action="store_true", help="Fast approximate optimisation (popsize=5, maxiter=30)")
+    parser.add_argument("--optimize-full",   action="store_true", help="Thorough optimisation (popsize=12, maxiter=80)")
+    parser.add_argument("--train-years",     type=int, default=7)
+    parser.add_argument("--test-years",      type=int, default=1)
+    parser.add_argument("--step-years",      type=int, default=1)
+    # Optional manual overrides — default None so speed-tier defaults apply
+    parser.add_argument("--popsize",         type=int, default=None, help="Override popsize (optional)")
+    parser.add_argument("--maxiter",         type=int, default=None, help="Override maxiter (optional)")
+
+    # Factor analysis
+    parser.add_argument("--factor-analysis", action="store_true", help="Factor IC + LOO analysis")
+    parser.add_argument("--horizons",        nargs="+", default=["1m", "3m", "6m", "12m"])
+
+    # Stress tests
+    parser.add_argument("--stress-test",    action="store_true", help="Stress tests + Monte Carlo")
+    parser.add_argument("--mc-runs",        type=int, default=300)
+
     args = parser.parse_args()
-    run_screener(run_type=args.run_type)
+
+    # Route to correct handler
+    if args.live_status:
+        _cmd_live_status(args)
+    elif args.scheduler_status:
+        _cmd_scheduler_status(args)
+    elif args.fetch_history:
+        _cmd_fetch_history(args)
+    elif args.coverage_report:
+        _cmd_coverage_report(args)
+    elif getattr(args, "diagnose_zf", False):
+        _cmd_diagnose_zf(args)
+    elif args.backtest:
+        _cmd_backtest(args)
+    elif args.optimize or args.optimize_fast or args.optimize_full:
+        _cmd_optimize(args)
+    elif args.factor_analysis:
+        _cmd_factor_analysis(args)
+    elif args.stress_test:
+        _cmd_stress_test(args)
+    else:
+        run_screener(run_type=args.run_type)

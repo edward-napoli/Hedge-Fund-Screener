@@ -17,6 +17,92 @@ from config import SLACK_WEBHOOK_URL, ENABLE_SLACK_ALERTS
 logger = logging.getLogger(__name__)
 
 
+def send_slack_startup(
+    morning_utc: str,
+    afternoon_utc: str,
+    price_fetch_utc: str,
+    today: str,
+) -> None:
+    """
+    Send a Slack notification confirming the scheduler started, with today's run times.
+
+    Parameters
+    ----------
+    morning_utc, afternoon_utc, price_fetch_utc : str
+        Formatted run times, e.g. "10:30 UTC".
+    today : str
+        Date string "YYYY-MM-DD".
+    """
+    if not ENABLE_SLACK_ALERTS:
+        return
+    if not SLACK_WEBHOOK_URL:
+        logger.warning("SLACK_WEBHOOK_URL not set — skipping startup Slack alert.")
+        return
+
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        "*Hedge Fund Screener — Scheduler Started*",
+        f"_{now_utc}_",
+        "",
+        f"*Today's Schedule ({today}):*",
+        f"  Morning run:   `{morning_utc}`",
+        f"  Afternoon run: `{afternoon_utc}`",
+        f"  Price fetch:   `{price_fetch_utc}`",
+        "",
+        "_Times are UTC, recalculated daily to account for DST_",
+    ]
+    payload = {"text": "\n".join(lines)}
+    try:
+        resp = requests.post(
+            SLACK_WEBHOOK_URL,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"Slack startup alert HTTP {resp.status_code}: {resp.text}")
+        else:
+            logger.info("Slack startup notification sent.")
+    except Exception as exc:
+        logger.warning(f"Slack startup notification failed: {exc}")
+
+
+def send_slack_validation_alert(warnings: list) -> None:
+    """
+    Send a Slack alert when post-run validation finds anomalies.
+
+    Parameters
+    ----------
+    warnings : list[str]
+        List of human-readable validation failure messages.
+    """
+    if not ENABLE_SLACK_ALERTS or not SLACK_WEBHOOK_URL:
+        return
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        "*Hedge Fund Screener — VALIDATION WARNING*",
+        f"_{now_utc}_",
+        "",
+        "*Issues detected after run:*",
+    ]
+    for w in warnings:
+        lines.append(f"  [!] {w}")
+    payload = {"text": "\n".join(lines)}
+    try:
+        resp = requests.post(
+            SLACK_WEBHOOK_URL,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"Slack validation alert HTTP {resp.status_code}: {resp.text}")
+        else:
+            logger.info("Slack validation alert sent (%d warnings).", len(warnings))
+    except Exception as exc:
+        logger.warning(f"Slack validation alert failed: {exc}")
+
+
 def send_slack_alert(
     run_type: str,
     df,
@@ -26,6 +112,7 @@ def send_slack_alert(
     elapsed_seconds: float,
     sheet_url: Optional[str],
     is_partial: bool = False,
+    validation_warnings: Optional[list] = None,
 ) -> None:
     """
     Send a Slack webhook notification summarising the screener run.
@@ -55,6 +142,8 @@ def send_slack_alert(
         Google Sheets URL, or None if Sheets upload was skipped.
     is_partial : bool
         True if fewer than PARTIAL_RUN_THRESHOLD stocks were fetched.
+    validation_warnings : list[str] or None
+        Validation failure messages to append to the alert.
     """
     if not ENABLE_SLACK_ALERTS:
         logger.debug("Slack alerts disabled (ENABLE_SLACK_ALERTS=false) — skipping.")
@@ -73,6 +162,7 @@ def send_slack_alert(
             elapsed_seconds=elapsed_seconds,
             sheet_url=sheet_url,
             is_partial=is_partial,
+            validation_warnings=validation_warnings or [],
         )
     except Exception as e:
         logger.error(f"Slack alert failed: {e}")
@@ -87,6 +177,7 @@ def _post_alert(
     elapsed_seconds: float,
     sheet_url: Optional[str],
     is_partial: bool,
+    validation_warnings: list,
 ) -> None:
     """
     Build and POST the Slack payload.
@@ -136,6 +227,12 @@ def _post_alert(
             # Rank Delta is negative = moved UP   (rank number decreased = better)
             arrow = "↑" if delta < 0 else "↓"
             lines.append(f"  {ticker}: {abs(delta)} places {arrow}")
+
+    if validation_warnings:
+        lines.append("")
+        lines.append("*Validation Warnings:*")
+        for w in validation_warnings:
+            lines.append(f"  [!] {w}")
 
     if sheet_url:
         lines.append("")

@@ -197,6 +197,24 @@ def _should_run(ref_date: date) -> bool:
 # Job functions called by the scheduler
 # ---------------------------------------------------------------------------
 
+def _log_market_regime() -> None:
+    """Log the current SPY 200-day MA market regime to the scheduler log."""
+    try:
+        from backtest import is_risk_on, fetch_spy_prices
+        spy_series = fetch_spy_prices()
+        risk_on = is_risk_on(spy_series, date.today())
+        regime_label = "RISK-ON" if risk_on else "RISK-OFF"
+        weighting_scheme = os.getenv("WEIGHTING_SCHEME", "risk_parity")
+        regime_filter_on = os.getenv("REGIME_FILTER", "true").lower() == "true"
+        logger.info(
+            f"Market Regime: {regime_label}  |  "
+            f"Weighting: {weighting_scheme}  |  "
+            f"Regime filter: {'ON' if regime_filter_on else 'OFF'}"
+        )
+    except Exception as exc:
+        logger.warning(f"Could not determine market regime: {exc}")
+
+
 def run_morning() -> None:
     """
     Execute the morning screener run.
@@ -207,6 +225,7 @@ def run_morning() -> None:
     if not _should_run(today):
         return
     logger.info(f"Firing MORNING run for {today}.")
+    _log_market_regime()
     try:
         from main import run_screener
         run_screener(run_type="morning")
@@ -224,6 +243,7 @@ def run_afternoon() -> None:
     if not _should_run(today):
         return
     logger.info(f"Firing AFTERNOON run for {today}.")
+    _log_market_regime()
     try:
         from main import run_screener
         run_screener(run_type="afternoon")
@@ -308,6 +328,27 @@ def _check_and_fire() -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _write_pid() -> None:
+    """Write current process PID to logs/scheduler.pid for stop_scheduler.bat."""
+    pid_path = os.path.join("logs", "scheduler.pid")
+    try:
+        with open(pid_path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        logger.info(f"PID {os.getpid()} written to {pid_path}")
+    except Exception as exc:
+        logger.warning(f"Could not write PID file: {exc}")
+
+
+def _remove_pid() -> None:
+    """Remove the PID file on clean shutdown."""
+    pid_path = os.path.join("logs", "scheduler.pid")
+    try:
+        if os.path.exists(pid_path):
+            os.remove(pid_path)
+    except Exception:
+        pass
+
+
 def main() -> None:
     """
     Start the blocking scheduler.
@@ -319,14 +360,33 @@ def main() -> None:
     today = date.today()
     morning_utc, afternoon_utc, price_fetch_utc = _get_schedule_times(today)
 
+    m_str = morning_utc.strftime("%H:%M UTC")
+    a_str = afternoon_utc.strftime("%H:%M UTC")
+    p_str = price_fetch_utc.strftime("%H:%M UTC")
+
     logger.info("=" * 60)
     logger.info("Hedge Fund Stock Screener — Scheduler Starting")
     logger.info(f"Today ({today}) schedule:")
-    logger.info(f"  Morning run:    {morning_utc.strftime('%H:%M UTC')}")
-    logger.info(f"  Afternoon run:  {afternoon_utc.strftime('%H:%M UTC')}")
-    logger.info(f"  Price fetch:    {price_fetch_utc.strftime('%H:%M UTC')}")
+    logger.info(f"  Morning run:    {m_str}")
+    logger.info(f"  Afternoon run:  {a_str}")
+    logger.info(f"  Price fetch:    {p_str}")
     logger.info("(Times are dynamic — recalculated daily based on market open/close + DST)")
     logger.info("=" * 60)
+
+    # Write PID file so stop_scheduler.bat can find this process
+    _write_pid()
+
+    # Send Slack startup notification (gated by ENABLE_SLACK_ALERTS)
+    try:
+        from alerts import send_slack_startup
+        send_slack_startup(
+            morning_utc=m_str,
+            afternoon_utc=a_str,
+            price_fetch_utc=p_str,
+            today=today.isoformat(),
+        )
+    except Exception as exc:
+        logger.warning(f"Slack startup notification failed: {exc}")
 
     scheduler = BlockingScheduler(timezone="UTC")
 
@@ -346,6 +406,8 @@ def main() -> None:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Scheduler stopped by user.")
+    finally:
+        _remove_pid()
 
 
 if __name__ == "__main__":

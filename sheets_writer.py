@@ -64,7 +64,7 @@ _RETENTION_DAYS = 30
 _DATE_TAB_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Permanent tabs that are NEVER deleted by _delete_old_tabs
-_PERMANENT_TABS = {"Summary", "Analytics", "Price History", "Score History", "Efficacy Analysis"}
+_PERMANENT_TABS = {"Summary", "Analytics", "Price History", "Score History", "Efficacy Analysis", "Backtest Results"}
 
 RUN_HISTORY_FILE = "run_history.json"
 
@@ -690,6 +690,9 @@ def write_summary_sheet(
     run_type: str = "morning",
     is_partial: bool = False,
     top25_changes: Optional[dict] = None,
+    regime_label: Optional[str] = None,
+    weighting_scheme: Optional[str] = None,
+    regime_filter_on: Optional[bool] = None,
 ) -> gspread.Worksheet:
     """
     Create / update the 'Summary' worksheet with key statistics and top-25 changes.
@@ -743,6 +746,12 @@ def write_summary_sheet(
     rows.append(["Stocks Ranked:",       len(df)])
     rows.append(["Avg Composite Score:", round(avg_score, 2)])
     rows.append(["Elapsed Time (s):",    round(elapsed_seconds, 1)])
+    if regime_label is not None:
+        rows.append(["Market Regime:",   regime_label])
+    if weighting_scheme is not None:
+        rows.append(["Weighting Scheme:", weighting_scheme.replace("_", " ").title()])
+    if regime_filter_on is not None:
+        rows.append(["Regime Filter:",   "ON" if regime_filter_on else "OFF"])
     rows.append([])
 
     # Top-25 changes section
@@ -1614,6 +1623,364 @@ def write_efficacy_tab_insufficient(
 
 
 # ---------------------------------------------------------------------------
+# Backtest Results tab
+# ---------------------------------------------------------------------------
+
+def write_backtest_tab(
+    ss: gspread.Spreadsheet,
+    backtest_results:   dict | None = None,
+    wf_results:         dict | None = None,
+    stress_results:     dict | None = None,
+    factor_results:     dict | None = None,
+    comparison_results: dict | None = None,
+) -> gspread.Worksheet:
+    """
+    Write a 'Backtest Results' permanent tab with sections for:
+      - Strategy performance overview (vs SPY benchmark)
+      - Walk-forward optimisation summary
+      - Stress period table
+      - Monte Carlo summary
+      - TC sensitivity table
+      - Top-N sensitivity table
+      - Factor contribution (LOO) table
+      - Factor IC table
+
+    Parameters
+    ----------
+    ss : gspread.Spreadsheet
+    backtest_results : dict from backtest.run_backtest()
+    wf_results : dict from weight_optimizer.walk_forward_optimise()
+    stress_results : dict from stress_test.run_all_stress_tests()
+    factor_results : dict from factor_analysis.run_factor_analysis()
+
+    Returns
+    -------
+    gspread.Worksheet
+    """
+    import pandas as pd
+
+    ws = _get_or_create_worksheet(ss, "Backtest Results", rows=500, cols=20)
+    ws.clear()
+
+    all_rows: list[list] = []
+
+    def _section_header(title: str) -> None:
+        all_rows.append([title])
+        all_rows.append([])
+
+    def _row(*cells) -> None:
+        all_rows.append(list(cells))
+
+    def _fmt(v, decimals: int = 2) -> str:
+        """Format a numeric value to N decimal places, or return 'n/a'."""
+        if v is None or v == "n/a":
+            return "n/a"
+        try:
+            return f"{float(v):.{decimals}f}"
+        except (TypeError, ValueError):
+            return str(v)
+
+    # ── Section 0: 4-Variant Comparison (risk-parity / regime filter) ─────────
+    if comparison_results:
+        _section_header("STRATEGY VARIANT COMPARISON")
+        _row("Variant", "CAGR %", "Sharpe", "Sortino", "Max DD %", "Calmar", "Win Rate %", "Volatility %", "Periods")
+        for variant_key, res in comparison_results.items():
+            m  = res.get("metrics", {})
+            _row(
+                variant_key,
+                _fmt(m.get("cagr")),
+                _fmt(m.get("sharpe"), 3),
+                _fmt(m.get("sortino"), 3),
+                _fmt(m.get("max_drawdown")),
+                _fmt(m.get("calmar"), 3),
+                _fmt(m.get("win_rate")),
+                _fmt(m.get("volatility")),
+                m.get("n_periods", ""),
+            )
+        all_rows.append([])
+
+    # ── Section 1: Strategy Performance ──────────────────────────────────────
+    _section_header("STRATEGY PERFORMANCE")
+
+    if backtest_results and "metrics" in backtest_results:
+        m  = backtest_results["metrics"]
+        bm = backtest_results.get("benchmark_metrics", {})
+        p  = backtest_results.get("params", {})
+
+        _row("Parameter", "Value")
+        _row("Period", f"{p.get('start','?')} → {p.get('end','?')}")
+        _row("Rebalancing", p.get("freq", "?"))
+        _row("Portfolio", f"Top {p.get('top_n','?')} | {'Long-Short' if p.get('long_short') else 'Long-Only'}")
+        _row("Transaction Cost (bps)", p.get("tc_bps", "?"))
+        all_rows.append([])
+
+        _row("Metric", "Strategy", "SPY Benchmark")
+        for label, key in [
+            ("CAGR (%)",           "cagr"),
+            ("Total Return (%)",   "total_return"),
+            ("Sharpe Ratio",       "sharpe"),
+            ("Sortino Ratio",      "sortino"),
+            ("Calmar Ratio",       "calmar"),
+            ("Max Drawdown (%)",   "max_drawdown"),
+            ("Volatility (%)",     "volatility"),
+            ("Win Rate (%)",       "win_rate"),
+            ("Best Period (%)",    "best_period"),
+            ("Worst Period (%)",   "worst_period"),
+            ("Periods",            "n_periods"),
+        ]:
+            decimals = 0 if key == "n_periods" else 2
+            _row(label, _fmt(m.get(key), decimals), _fmt(bm.get(key), decimals))
+
+        # Relative metrics vs SPY benchmark
+        rel = backtest_results.get("relative_metrics", {})
+        if rel:
+            all_rows.append([])
+            _row("VS SPY BENCHMARK")
+            _row("Metric", "Value")
+            _row("Excess CAGR (%)",      _fmt(rel.get("excess_cagr")))
+            _row("Beta",                 _fmt(rel.get("beta"), 4))
+            _row("Jensen Alpha (ann %)", _fmt(rel.get("alpha")))
+            _row("Correlation",          _fmt(rel.get("correlation"), 4))
+            _row("Information Ratio",    _fmt(rel.get("information_ratio"), 4))
+
+        # Regime breakdown
+        regime_m = backtest_results.get("regime_metrics", {})
+        if regime_m:
+            all_rows.append([])
+            _row("Regime", "CAGR (%)", "Sharpe", "Periods")
+            for regime, rm in regime_m.items():
+                _row(
+                    regime.capitalize(),
+                    _fmt(rm.get("cagr")),
+                    _fmt(rm.get("sharpe"), 3),
+                    rm.get("n_periods", "n/a"),
+                )
+
+        # Year-by-year breakdown derived from portfolio_values and benchmark_returns
+        pv_raw = backtest_results.get("portfolio_values")
+        if pv_raw is not None:
+            # Normalise to {date: float} dict regardless of whether it's a pd.Series or dict
+            if hasattr(pv_raw, "items"):
+                pv_dict = {
+                    (k.date() if hasattr(k, "date") else k): float(v)
+                    for k, v in pv_raw.items()
+                }
+            else:
+                pv_dict = {}
+
+            # Build year-end NAV: take the last recorded NAV in each calendar year
+            year_end_nav: dict[int, float] = {}
+            for dt, nav in sorted(pv_dict.items(), key=lambda x: str(x[0])):
+                yr = int(str(dt)[:4])
+                year_end_nav[yr] = nav  # keep overwriting → last entry wins
+
+            # Build SPY year returns from benchmark_returns Series if available
+            bench_rets_raw = backtest_results.get("benchmark_returns")
+            spy_year_ret: dict[int, float] = {}
+            if bench_rets_raw is not None and hasattr(bench_rets_raw, "items"):
+                import math
+                yr_compound: dict[int, float] = {}
+                for dt, r in bench_rets_raw.items():
+                    yr = int(str(dt)[:4])
+                    if yr not in yr_compound:
+                        yr_compound[yr] = 1.0
+                    yr_compound[yr] *= (1.0 + float(r))
+                spy_year_ret = {yr: (v - 1.0) * 100 for yr, v in yr_compound.items()}
+
+            if year_end_nav:
+                all_rows.append([])
+                _row("YEAR-BY-YEAR RETURNS")
+                _row("Year", "Strategy Return (%)", "SPY Return (%)")
+                prev_nav = None
+                for yr in sorted(year_end_nav):
+                    nav = year_end_nav[yr]
+                    ret_strat = ((nav / prev_nav) - 1) * 100 if prev_nav is not None else "n/a"
+                    ret_spy   = spy_year_ret.get(yr)
+                    _row(
+                        yr,
+                        _fmt(ret_strat) if ret_strat != "n/a" else "n/a",
+                        _fmt(ret_spy) if ret_spy is not None else "n/a",
+                    )
+                    prev_nav = nav
+
+    else:
+        _row("No backtest results available. Run python main.py --backtest first.")
+
+    all_rows.append([])
+    all_rows.append([])
+
+    # ── Section 2: Walk-Forward Optimisation ──────────────────────────────────
+    _section_header("WALK-FORWARD OPTIMISATION")
+
+    if wf_results and "windows" in wf_results:
+        p = wf_results.get("params", {})
+        _row("Train years", p.get("train_years"), "Test years", p.get("test_years"))
+        all_rows.append([])
+
+        _row("Window", "Train Sharpe", "Test Sharpe (Optimised)", "Test Sharpe (Default)")
+        for w in wf_results["windows"]:
+            label = f"{w['train_start'][:7]}→{w['test_end'][:7]}"
+            _row(label, w.get("train_sharpe"), w.get("test_sharpe"), w.get("default_test_sharpe"))
+
+        oos = wf_results.get("oos_combined_metrics", {})
+        if oos:
+            all_rows.append([])
+            _row("OOS Combined", f"CAGR={oos.get('cagr','?')}%", f"Sharpe={oos.get('sharpe','?')}", f"MaxDD={oos.get('max_drawdown','?')}%")
+
+        avg_w = wf_results.get("average_optimal_weights", {})
+        if avg_w:
+            all_rows.append([])
+            _row("Weight Key", "Default", "Optimised")
+            from config import WEIGHTS as DW
+            for k in avg_w:
+                _row(k, DW.get(k, 0), avg_w[k])
+    else:
+        _row("No walk-forward results. Run python main.py --optimize first.")
+
+    all_rows.append([])
+    all_rows.append([])
+
+    # ── Section 3: Stress Periods ─────────────────────────────────────────────
+    _section_header("HISTORICAL STRESS PERIODS")
+
+    sp_df = (stress_results or {}).get("stress_periods")
+    if sp_df is not None and not sp_df.empty:
+        _row(*sp_df.columns.tolist())
+        for _, row in sp_df.iterrows():
+            _row(*[str(v) for v in row.tolist()])
+    else:
+        _row("No stress period results. Run python main.py --stress-test first.")
+
+    all_rows.append([])
+    all_rows.append([])
+
+    # ── Section 4: Monte Carlo ────────────────────────────────────────────────
+    _section_header("MONTE CARLO SIMULATION")
+
+    mc = (stress_results or {}).get("monte_carlo", {})
+    if mc:
+        for label, key in [
+            ("Runs",                    "n_runs"),
+            ("Base Sharpe",             "base_sharpe"),
+            ("Mean Sharpe",             "mean_sharpe"),
+            ("Median Sharpe",           "median_sharpe"),
+            ("5th Percentile Sharpe",   "p5_sharpe"),
+            ("95th Percentile Sharpe",  "p95_sharpe"),
+            ("% Positive Sharpe",       "pct_positive_sharpe"),
+        ]:
+            _row(label, mc.get(key, "n/a"))
+    else:
+        _row("No Monte Carlo results.")
+
+    all_rows.append([])
+    all_rows.append([])
+
+    # ── Section 5: TC Sensitivity ─────────────────────────────────────────────
+    _section_header("TRANSACTION COST SENSITIVITY")
+
+    tc_df = (stress_results or {}).get("tc_sensitivity")
+    if tc_df is not None and not tc_df.empty:
+        _row(*tc_df.columns.tolist())
+        for _, row in tc_df.iterrows():
+            _row(*[str(round(v, 3)) if isinstance(v, float) else str(v) for v in row.tolist()])
+    else:
+        _row("No TC sensitivity results.")
+
+    all_rows.append([])
+    all_rows.append([])
+
+    # ── Section 6: Top-N Sensitivity ──────────────────────────────────────────
+    _section_header("TOP-N PORTFOLIO SIZE SENSITIVITY")
+
+    tn_df = (stress_results or {}).get("topn_sensitivity")
+    if tn_df is not None and not tn_df.empty:
+        _row(*tn_df.columns.tolist())
+        for _, row in tn_df.iterrows():
+            _row(*[str(round(v, 3)) if isinstance(v, float) else str(v) for v in row.tolist()])
+    else:
+        _row("No top-N sensitivity results.")
+
+    all_rows.append([])
+    all_rows.append([])
+
+    # ── Section 7: Factor LOO Contribution ────────────────────────────────────
+    _section_header("FACTOR LEAVE-ONE-OUT CONTRIBUTION")
+
+    loo_df = (factor_results or {}).get("loo_contribution")
+    if loo_df is not None and not loo_df.empty:
+        _row(*loo_df.columns.tolist())
+        for _, row in loo_df.iterrows():
+            _row(*[str(round(v, 3)) if isinstance(v, float) else str(v) for v in row.tolist()])
+    else:
+        _row("No LOO results. Run python main.py --factor-analysis first.")
+
+    all_rows.append([])
+    all_rows.append([])
+
+    # ── Section 8: Factor IC Table ────────────────────────────────────────────
+    _section_header("FACTOR INFORMATION COEFFICIENTS (IC)")
+
+    ic_df = (factor_results or {}).get("ic_table")
+    if ic_df is not None and not ic_df.empty:
+        # Show IC columns only
+        ic_cols = [c for c in ic_df.columns if c.endswith("_IC")]
+        _row("Factor", *ic_cols)
+        for factor_name in ic_df.index:
+            row_vals = [ic_df.at[factor_name, c] for c in ic_cols]
+            _row(factor_name, *[round(v, 4) if isinstance(v, float) else "n/a" for v in row_vals])
+    else:
+        _row("No IC results. Run python main.py --factor-analysis first.")
+
+    all_rows.append([])
+    _row(f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M UTC')}")
+
+    # ── Write to sheet ────────────────────────────────────────────────────────
+    # Ensure we have enough rows
+    if len(all_rows) > ws.row_count:
+        ws.add_rows(len(all_rows) - ws.row_count + 10)
+
+    ws.update("A1", all_rows, value_input_option="USER_ENTERED")
+
+    # Apply section header formatting (bold, dark background)
+    section_header_rows = []
+    for i, row in enumerate(all_rows, start=1):
+        if row and isinstance(row[0], str) and row[0].isupper() and len(row) == 1:
+            section_header_rows.append(i)
+
+    if section_header_rows:
+        sheet_id_int = ws.id
+        fmt_requests = []
+        for r in section_header_rows:
+            fmt_requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id_int,
+                        "startRowIndex": r - 1,
+                        "endRowIndex": r,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 10,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": HEADER_BG_COLOR,
+                            "textFormat": {
+                                "foregroundColor": HEADER_TEXT_COLOR,
+                                "bold": True,
+                                "fontSize": 11,
+                            },
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat)",
+                }
+            })
+        if fmt_requests:
+            ss.batch_update({"requests": fmt_requests})
+
+    logger.info(f"Backtest Results tab updated ({len(all_rows)} rows).")
+    return ws
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -1627,6 +1994,9 @@ def write_to_sheets(
     run_type: str = "morning",
     is_partial: bool = False,
     top25_changes: Optional[dict] = None,
+    regime_label: Optional[str] = None,
+    weighting_scheme: Optional[str] = None,
+    regime_filter_on: Optional[bool] = None,
 ) -> str:
     """
     Write ranked DataFrame to Google Sheets and return the spreadsheet URL.
@@ -1677,6 +2047,9 @@ def write_to_sheets(
         run_type=run_type,
         is_partial=is_partial,
         top25_changes=top25_changes,
+        regime_label=regime_label,
+        weighting_scheme=weighting_scheme,
+        regime_filter_on=regime_filter_on,
     )
     write_analytics_tab(ss, df)
     _delete_old_tabs(ss)
