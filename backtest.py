@@ -125,11 +125,23 @@ def fetch_spy_prices(
             end=fetch_end.isoformat(),
             auto_adjust=True,
         )
-        if hist.empty:
-            logger.error("SPY yfinance fetch returned empty DataFrame")
+        if hist is None or not isinstance(hist, pd.DataFrame) or hist.empty:
+            logger.error("SPY yfinance fetch returned empty or None result")
+            return None
+
+        # yfinance >= 0.2 sometimes wraps columns in a MultiIndex (field, ticker).
+        # Flatten to single-level so ["Close"] always returns a Series.
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+
+        if "Close" not in hist.columns:
+            logger.error("SPY fetch has no 'Close' column — found: %s", list(hist.columns))
             return None
 
         s = hist["Close"].copy()
+        # Guard: if still a DataFrame (duplicate column names), take the first column.
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
         s.index = pd.to_datetime(s.index).date
         s = s.sort_index()
 
