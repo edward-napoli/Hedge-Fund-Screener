@@ -44,6 +44,9 @@ Sequential fetching of 1,200+ stocks from the Yahoo Finance API takes ~40 minute
 **Why a dynamic scheduler rather than fixed cron times?**
 Market open and close times vary by exchange and shift with Daylight Saving Time. The scheduler calculates run times dynamically in UTC each day from real market hours, so the morning run always fires shortly after the earliest market opens (HKEX ~01:30 UTC) and the afternoon run after the earliest close (TSE ~06:30 UTC).
 
+**Why are P/E and P/B percentile-ranked within the universe rather than used as absolute values?**
+Absolute P/E and P/B values created a structural bias toward Japanese stocks, which trade at very low P/B ratios (often below 1.0) due to historical deflation and TSE reform pressure rather than superior business quality. A Japanese industrial with P/B = 0.8 received a valuation-term score 400+ points higher than a high-quality US company with P/B = 8, purely because of this regional structural difference — before any quality metrics were considered. Percentile normalization preserves the value signal (cheap-relative-to-peers is rewarded) while eliminating the cross-regional structural bias. The formula structure is unchanged; only the Pe and Pb inputs are relativised.
+
 ---
 
 ## Composite Score Formula
@@ -53,6 +56,8 @@ Score = 0.3(E₁) + 0.8(E₃) + 1.4(E₅) + 2.5(Ef)
       + 1.4(C) + 3.25(Z) + 2.65(F) + 0.2(A)
       + 3.25 × (Y×(2 − Pr/100) − (5×Pe + 3×Pb))
 ```
+
+> **Note:** Pe and Pb are cross-sectionally normalized to percentile ranks (0–100) within the screened universe on each run before being used in the formula. A stock at the 20th percentile for P/E (cheap relative to peers) receives Pe = 20; a stock at the 80th percentile (expensive relative to peers) receives Pe = 80, regardless of the absolute ratio. Stocks with missing P/E or P/B data receive the neutral default of 50. All other factors remain on their absolute scales.
 
 | Symbol | Metric | Weight Rationale |
 |--------|--------|-----------------|
@@ -69,10 +74,10 @@ Score = 0.3(E₁) + 0.8(E₃) + 1.4(E₅) + 2.5(Ef)
 | A | Annual Net Income | Absolute profitability anchor |
 | Y | Dividend Yield | Income, adjusted by payout sustainability |
 | Pr | Payout Ratio | Dividend safety check |
-| Pe | P/E Ratio | Valuation (penalised) |
-| Pb | P/B Ratio | Asset valuation (penalised) |
+| Pe | P/E Ratio | Valuation (penalised) — **percentile-ranked within universe** |
+| Pb | P/B Ratio | Asset valuation (penalised) — **percentile-ranked within universe** |
 
-Missing values default to **0**. Stocks missing more than 8 of 15 metrics are excluded entirely.
+Missing values default to **0** (or **50** for Pe/Pb after normalization). Stocks missing more than 8 of 15 metrics are excluded entirely.
 
 ---
 

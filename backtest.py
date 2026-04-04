@@ -35,6 +35,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+from scorer import normalize_pe_pb_factors
 
 load_dotenv()
 
@@ -802,8 +803,8 @@ def run_backtest(
     tickers_all = list(fundamentals_panel.keys())
 
     for i, rebal_date in enumerate(rebal_dates):
-        # --- Step 1: Compute scores for all tickers as of rebal_date ---
-        scored: list[tuple[str, float]] = []
+        # --- Step 1: Build fundamental snapshots for all tickers ---
+        snaps: list[tuple[str, dict]] = []
         for ticker in tickers_all:
             snap = get_fundamental_snapshot(ticker, rebal_date, use_quarterly=True)
             if not snap:
@@ -862,7 +863,15 @@ def run_backtest(
                 snap["div_yield_pct"] = None
 
             # altman_z and piotroski_f are computed by get_fundamental_snapshot()
+            snaps.append((ticker, snap))
 
+        # --- Step 1b: Normalize P/E and P/B cross-sectionally for this date ---
+        # Only stocks available as of rebal_date are included — no look-ahead bias.
+        normalize_pe_pb_factors(snaps)
+
+        # --- Step 1c: Score all tickers with normalized valuation metrics ---
+        scored: list[tuple[str, float]] = []
+        for ticker, snap in snaps:
             s = score_row(snap, weights)
             if s is not None:
                 scored.append((ticker, s))

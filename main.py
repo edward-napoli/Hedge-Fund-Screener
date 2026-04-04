@@ -353,6 +353,20 @@ def _do_run(run_type: str) -> dict:
     df = score_and_rank(df)
 
     # ------------------------------------------------------------------
+    # 5b. Diagnostic: top-25 regional concentration
+    # ------------------------------------------------------------------
+    if "Country" in df.columns:
+        top25 = df.head(25)
+        region_counts = (
+            top25["Country"]
+            .replace("N/A", "Unknown")
+            .value_counts()
+        )
+        logger.info("\n[Diagnostic] Top-25 stocks by region:")
+        for country, count in region_counts.items():
+            logger.info(f"  {country}: {count}")
+
+    # ------------------------------------------------------------------
     # 6. Compute deltas vs previous run
     # ------------------------------------------------------------------
     df = compute_deltas(df, previous)

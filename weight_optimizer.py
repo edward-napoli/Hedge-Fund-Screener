@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from scipy.optimize import differential_evolution, OptimizeResult
+from scorer import normalize_pe_pb_factors
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -300,6 +301,9 @@ def build_factor_matrix(
             }
             entries.append((ticker, factors))
 
+        # Normalize P/E and P/B cross-sectionally for this rebalancing date.
+        # Only stocks available as of rebal_date are included — no look-ahead bias.
+        normalize_pe_pb_factors(entries)
         matrix[date_str] = entries
 
         if (idx + 1) % 12 == 0 or idx == n - 1:
